@@ -1,0 +1,4 @@
+[workspace]
+members = ["crates/val-core", "crates/val-felt", "crates/val-view"]
+exclude = ["crates/val-ray"]
+resolver = "2"

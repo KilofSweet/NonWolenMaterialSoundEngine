@@ -1,0 +1,8 @@
+[package]
+name = "val-ray-legacy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+val-core = { path = "../val-core" }
+val-felt = { path = "../val-felt" }

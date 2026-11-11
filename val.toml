@@ -1,0 +1,115 @@
+# VAL runtime configuration. Distances are millimetres unless noted.
+# Material bounds use half-open AABBs: [bounds_min_mm, bounds_max_mm).
+
+[world]
+dimensions_mm = [128.0, 96.0, 96.0]
+voxel_size_mm = 1.0
+air_speed_mps = 343.0
+air_density_kg_m3 = 1.204
+air_absorption_m_inv = 0.0
+seed = 7
+
+[[emitters]]
+name = "main-emitter"
+position_mm = [18.0, 48.0, 48.0]
+radius_mm = 3.2
+frequency_hz = 20000.0
+amplitude = 1.0
+direction = [1.0, 0.0, 0.0]
+# Half-angle: a 25-degree forward cone keeps the direct source beam inside
+# the default first felt insert. Set 180 for an omnidirectional point source.
+cone_half_angle_degrees = 25.0
+
+[simulation]
+# The transport solve runs once at startup. ray_count reduces Monte Carlo speckle;
+# max_steps is the maximum spatial segments in a packet path, NOT animation steps.
+# Playback only changes visualization time; increasing speed does not rerun transport.
+ray_count = 131072
+max_steps = 512
+step_mm = 0.75
+timeline_rate_us_per_second = 60.0
+# Full-world time histogram: air and every material share one voxel/time field.
+# 24 x 20 us = 480 us history. Smaller bins improve temporal detail; more bins
+# extend playback history at a proportional GPU memory cost.
+energy_time_bin_us = 20.0
+energy_time_bins = 24
+
+[render]
+# Internal volume target is capped by both this scale and the max dimensions.
+resolution_scale = 0.22
+max_width = 420
+max_height = 315
+target_fps = 60
+pause_when_unfocused = true
+
+[visualization]
+# Energy gains are dimensionless response scales: response = 1 - exp(-voxel_energy * gain).
+wave_shell_thickness_mm = 1.0
+air_wave_gain = 1200.0
+source_glow_gain = 1.0
+felt_energy_gain = 1200.0
+felt_base_opacity_multiplier = 1.0
+# Exponential visual persistence only (not physical acoustic decay).
+# With 8 us, 3 time constants correspond to approximately 24 us of visible tail.
+voxel_fade_ms = 0.008
+# Energy controls both emitted color and alpha; this is the upper opacity at high energy.
+felt_energy_max_opacity = 0.10
+air_wave_max_opacity = 0.22
+energy_hot_color = [1.0, 0.88, 0.42]
+
+[[materials]]
+name = "warm-felt"
+bounds_min_mm = [64.0, 16.0, 16.0]
+bounds_max_mm = [128.0, 80.0, 80.0]
+sigma_a_m_inv = 60.0
+sigma_s_m_inv = 8.0
+anisotropy_g = 0.55
+sound_speed_mps = 220.0
+density_kg_m3 = 180.0
+# Effective dynamic density for the approximate air/material impedance boundary.
+# This is distinct from bulk density and should be measured/calibrated for real samples.
+effective_density_kg_m3 = 1.8
+porosity = 0.82
+visual_color = [0.95, 0.43, 0.12]
+visual_opacity = 0.012
+# Omit seed to derive it deterministically from world.seed and material order.
+gradient_axis = 1
+gradient_strength = 0.5
+clump_scale_per_m = 150.0
+clump_strength = 0.8
+
+# SERIAL-LAYER EXAMPLE (important):
+# The active warm-felt block above currently spans X=64..128 mm.
+# To put a second material BEHIND it along the +X source direction, first
+# change warm-felt.bounds_max_mm to [96.0, 80.0, 80.0]. Then uncomment the
+# following block, which occupies X=96..128 mm. Do not use X=24..48 here:
+# that would place the second block BEFORE the current felt, between source
+# and felt, and it would correctly be reached first.
+#
+# [[materials]]
+# name = "dense-felt-behind"
+# bounds_min_mm = [96.0, 16.0, 16.0]
+# bounds_max_mm = [128.0, 80.0, 80.0]
+# sigma_a_m_inv = 28.0
+# sigma_s_m_inv = 85.0
+# anisotropy_g = 0.35
+# sound_speed_mps = 190.0
+# density_kg_m3 = 260.0
+# effective_density_kg_m3 = 2.7
+# porosity = 0.68
+# visual_color = [0.18, 0.72, 0.82]
+# visual_opacity = 0.035
+# seed = 991
+# gradient_axis = 0
+# gradient_strength = 0.2
+# clump_scale_per_m = 100.0
+# clump_strength = 0.35
+
+[camera]
+target_mm = [64.0, 48.0, 48.0]
+yaw_radians = -0.55
+pitch_radians = 0.35
+distance_mm = 240.0
+min_distance_mm = 40.0
+max_distance_mm = 750.0
+movement_speed_mps = 0.06

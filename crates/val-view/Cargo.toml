@@ -1,0 +1,18 @@
+[package]
+name = "val-view"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+val-core = { path = "../val-core" }
+val-felt = { path = "../val-felt" }
+wgpu = "0.20"
+winit = "0.29"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.25"
+rand = "0.8"
+half = "1.8"
+egui = "0.28"
+egui-winit = "0.28"
+egui-wgpu = "0.28"
