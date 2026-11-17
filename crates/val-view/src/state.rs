@@ -21,12 +21,9 @@ impl PlaybackState {
 
     pub fn advance(&mut self, real_dt_seconds: f32, simulation: &SimulationConfig) {
         if !self.paused {
-            let history_end_us = simulation.energy_time_bin_us
-                * simulation.energy_time_bins as f32;
+            let history_end_us = simulation.energy_time_bin_us * simulation.energy_time_bins as f32;
             self.time_us = (self.time_us
-                + real_dt_seconds.max(0.0)
-                    * simulation.timeline_rate_us_per_second
-                    * self.speed)
+                + real_dt_seconds.max(0.0) * simulation.timeline_rate_us_per_second * self.speed)
                 .min(history_end_us);
             if self.time_us >= history_end_us {
                 self.paused = true;
@@ -43,8 +40,7 @@ impl PlaybackState {
     }
 
     pub fn scrub(&mut self, delta_us: f32, simulation: &SimulationConfig) {
-        let history_end_us = simulation.energy_time_bin_us
-            * simulation.energy_time_bins as f32;
+        let history_end_us = simulation.energy_time_bin_us * simulation.energy_time_bins as f32;
         self.time_us = (self.time_us + delta_us).clamp(0.0, history_end_us);
     }
 

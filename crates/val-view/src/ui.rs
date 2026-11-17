@@ -4,18 +4,180 @@
 //! caller validates the draft and rebuilds the material volume/transport field
 //! only after the user presses Apply.
 
-use val_core::config::{AppConfig, EmitterConfig, MaterialConfig};
-use glam::Vec3;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2};
+use glam::Vec3;
+use val_core::config::{AppConfig, EmitterConfig, MaterialConfig};
 
 use crate::renderer::CamUniform;
 use crate::state::PlaybackState;
+
+/// UI-only color themes. These values affect egui styling, never the GPU scene.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UiTheme {
+    Light,
+    #[default]
+    Dark,
+    Ocean,
+    TealCoral,
+    Crimson,
+}
+
+impl UiTheme {
+    pub const ALL: [Self; 5] = [
+        Self::Light,
+        Self::Dark,
+        Self::Ocean,
+        Self::TealCoral,
+        Self::Crimson,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+            Self::Ocean => "Palette 1 — Ocean / Orange",
+            Self::TealCoral => "Palette 2 — Teal / Coral",
+            Self::Crimson => "Palette 3 — Crimson",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+            Self::Ocean => "ocean",
+            Self::TealCoral => "teal-coral",
+            Self::Crimson => "crimson",
+        }
+    }
+
+    fn from_key(key: &str) -> Self {
+        match key.trim() {
+            "light" => Self::Light,
+            "ocean" => Self::Ocean,
+            "teal-coral" => Self::TealCoral,
+            "crimson" => Self::Crimson,
+            _ => Self::Dark,
+        }
+    }
+
+    fn colors(
+        self,
+    ) -> (
+        egui::Color32,
+        egui::Color32,
+        egui::Color32,
+        egui::Color32,
+        egui::Color32,
+    ) {
+        use egui::Color32 as C;
+        match self {
+            Self::Light => (
+                C::from_rgb(246, 247, 249),
+                C::from_rgb(255, 255, 255),
+                C::from_rgb(35, 42, 54),
+                C::from_rgb(50, 115, 175),
+                C::from_rgb(220, 226, 234),
+            ),
+            Self::Dark => (
+                C::from_rgb(23, 26, 36),
+                C::from_rgb(29, 34, 47),
+                C::from_rgb(225, 231, 240),
+                C::from_rgb(65, 155, 210),
+                C::from_rgb(57, 66, 84),
+            ),
+            Self::Ocean => (
+                C::from_rgb(0, 27, 43),
+                C::from_rgb(12, 52, 66),
+                C::from_rgb(255, 236, 210),
+                C::from_rgb(255, 128, 0),
+                C::from_rgb(23, 97, 107),
+            ),
+            Self::TealCoral => (
+                C::from_rgb(9, 38, 41),
+                C::from_rgb(16, 57, 58),
+                C::from_rgb(240, 237, 225),
+                C::from_rgb(240, 45, 53),
+                C::from_rgb(33, 124, 120),
+            ),
+            Self::Crimson => (
+                C::from_rgb(41, 44, 64),
+                C::from_rgb(54, 59, 80),
+                C::from_rgb(238, 242, 243),
+                C::from_rgb(240, 32, 67),
+                C::from_rgb(145, 157, 176),
+            ),
+        }
+    }
+
+    pub fn apply(self, ctx: &egui::Context) {
+        use egui::{Color32, Stroke, Visuals};
+        let (panel, window, text, accent, muted) = self.colors();
+        let mut visuals = if self == Self::Light {
+            Visuals::light()
+        } else {
+            Visuals::dark()
+        };
+        visuals.panel_fill = panel;
+        visuals.window_fill = window;
+        visuals.extreme_bg_color = if self == Self::Light {
+            Color32::from_rgb(235, 238, 242)
+        } else {
+            Color32::from_rgb(8, 13, 22)
+        };
+        visuals.faint_bg_color = muted;
+        visuals.code_bg_color = window;
+        visuals.override_text_color = Some(text);
+        visuals.hyperlink_color = accent;
+        visuals.selection.bg_fill = accent;
+        visuals.selection.stroke = Stroke::new(1.0, text);
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+        visuals.widgets.noninteractive.bg_fill = panel;
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
+        visuals.widgets.inactive.bg_fill = muted;
+        visuals.widgets.inactive.weak_bg_fill = muted;
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
+        visuals.widgets.hovered.bg_fill = accent;
+        visuals.widgets.hovered.weak_bg_fill = accent;
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, text);
+        visuals.widgets.active.bg_fill = accent;
+        visuals.widgets.active.weak_bg_fill = accent;
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0, text);
+        visuals.widgets.open.bg_fill = muted;
+        visuals.widgets.open.weak_bg_fill = muted;
+        ctx.set_visuals(visuals);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiAction {
     None,
     Apply,
     Save,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewportMode {
+    /// Existing GPU packet-path debug overlay.
+    Paths,
+    /// Existing energy-volume rendering.
+    #[default]
+    WaveField,
+    /// UI mode placeholder; the current renderer does not yet isolate a material.
+    MaterialInterior,
+}
+
+impl UiTheme {
+    fn load() -> Self {
+        std::fs::read_to_string("val-theme.txt")
+            .map(|value| Self::from_key(&value))
+            .unwrap_or_default()
+    }
+
+    fn save(self) {
+        // Kept separate from val.toml so GUI preferences do not modify engine configuration.
+        let _ = std::fs::write("val-theme.txt", self.key());
+    }
 }
 
 pub struct UiState {
@@ -29,6 +191,9 @@ pub struct UiState {
     pub show_boundaries: bool,
     /// Draw the sampled packet paths recorded by the transport compute shader.
     pub debug_show_rays: bool,
+    /// Active viewport presentation tab. Only Paths and WaveField are currently rendered.
+    pub viewport_mode: ViewportMode,
+    pub theme: UiTheme,
 }
 
 impl Default for UiState {
@@ -39,6 +204,8 @@ impl Default for UiState {
             viewport_rect: None,
             show_boundaries: true,
             debug_show_rays: false,
+            viewport_mode: ViewportMode::WaveField,
+            theme: UiTheme::load(),
         }
     }
 }
@@ -52,63 +219,159 @@ pub fn draw(
     camera: &CamUniform,
 ) -> UiAction {
     let mut action = UiAction::None;
+    state.theme.apply(ctx);
 
-    egui::SidePanel::left("val_runtime_editor")
-        .default_width(390.0)
-        .min_width(320.0)
-        .max_width(520.0)
+    // 1) Application menu and command toolbar (Blender / CAD-style layout).
+    egui::TopBottomPanel::top("val_main_toolbar").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.strong("VAL");
+            ui.separator();
+            ui.menu_button("File", |ui| {
+                if ui.button("Save configuration…").clicked() {
+                    action = UiAction::Save;
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                ui.label("Configuration editing is in the Properties panel");
+            });
+            ui.menu_button("View", |ui| {
+                ui.label("Viewport layouts");
+                ui.separator();
+                ui.menu_button("Theme", |ui| {
+                    for theme in UiTheme::ALL {
+                        if ui
+                            .selectable_label(state.theme == theme, theme.label())
+                            .clicked()
+                        {
+                            state.theme = theme;
+                            state.theme.save();
+                            state.theme.apply(ctx);
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
+            ui.menu_button("Simulation", |ui| {
+                if ui.button("Apply & rebuild").clicked() {
+                    action = UiAction::Apply;
+                    ui.close_menu();
+                }
+            });
+            ui.menu_button("Help", |ui| {
+                ui.label("Virtual Acoustic Laboratory");
+            });
+            ui.separator();
+            if ui.button("▶ Run / Pause").clicked() {
+                playback.toggle_pause();
+            }
+            if ui.button("↺ Reset").clicked() {
+                playback.reset();
+            }
+            ui.separator();
+            if ui.button("Apply & rebuild").clicked() {
+                action = UiAction::Apply;
+            }
+            if ui.button("Save").clicked() {
+                action = UiAction::Save;
+            }
+        });
+    });
+
+    // 2) Scene Explorer: selection and hierarchy only; detailed editing stays on the right.
+    egui::SidePanel::left("val_scene_explorer")
+        .default_width(220.0)
+        .min_width(170.0)
+        .max_width(340.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.heading("Scene");
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::CollapsingHeader::new(format!("Emitters ({})", config.emitters.len()))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for (index, emitter) in config.emitters.iter().enumerate() {
+                            if ui
+                                .selectable_label(
+                                    state.selected_emitter == index,
+                                    format!("◉ {}", emitter.name),
+                                )
+                                .clicked()
+                            {
+                                state.selected_emitter = index;
+                                playback.frequency_hz = emitter.frequency_hz;
+                            }
+                        }
+                    });
+                egui::CollapsingHeader::new(format!("Materials ({})", config.materials.len()))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for (index, material) in config.materials.iter().enumerate() {
+                            if ui
+                                .selectable_label(
+                                    state.selected_material == index,
+                                    format!("▧ {}", material.name),
+                                )
+                                .clicked()
+                            {
+                                state.selected_material = index;
+                            }
+                        }
+                    });
+                egui::CollapsingHeader::new("Environment")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(format!(
+                            "World: {:.0} × {:.0} × {:.0} mm",
+                            config.world.dimensions_mm[0],
+                            config.world.dimensions_mm[1],
+                            config.world.dimensions_mm[2]
+                        ));
+                        ui.label(format!("Voxel: {:.2} mm", config.world.voxel_size_mm));
+                    });
+            });
+        });
+
+    // 3) Properties Inspector: existing configuration editors, moved to the right.
+    egui::SidePanel::right("val_properties_inspector")
+        .default_width(360.0)
+        .min_width(290.0)
+        .max_width(500.0)
         .resizable(true)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.heading("VAL");
-                    ui.label("Virtual Acoustic Laboratory");
+                    ui.heading("Properties");
+                    ui.label("Selected scene object and experiment settings");
+                    ui.horizontal(|ui| {
+                        ui.label("Interface theme");
+                        let mut selected_theme = state.theme;
+                        egui::ComboBox::from_id_source("val_theme_properties")
+                            .selected_text(selected_theme.label())
+                            .show_ui(ui, |ui| {
+                                for theme in UiTheme::ALL {
+                                    ui.selectable_value(&mut selected_theme, theme, theme.label());
+                                }
+                            });
+                        if selected_theme != state.theme {
+                            state.theme = selected_theme;
+                            state.theme.save();
+                            state.theme.apply(ctx);
+                        }
+                    });
                     ui.add_space(6.0);
-
-                    egui::CollapsingHeader::new("Scene overlays")
+                    egui::CollapsingHeader::new("Viewport overlays")
                         .default_open(true)
                         .show(ui, |ui| {
                             ui.checkbox(&mut state.show_boundaries, "Show world/material boundaries");
-                            ui.checkbox(&mut state.debug_show_rays, "Debug mode: show transported rays");
+                            ui.small("Use the Packet paths tab to show the sampled GPU packet trajectories.");
                             ui.small("Ray view draws a deterministic sample of actual GPU packet paths; the energy solve still uses every configured packet.");
                             ui.small("Line color identifies the emitter; brightness follows the packet's remaining energy.");
                             ui.small(format!(
                                 "Debug sample: up to {} rays per emitter × {} segments per ray.",
                                 crate::renderer::DEBUG_RAYS_PER_EMITTER,
                                 crate::renderer::DEBUG_MAX_SEGMENTS_PER_RAY,
-                            ));
-                        });
-
-                    egui::CollapsingHeader::new("Playback")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if ui.button(if playback.paused { "Play" } else { "Pause" }).clicked() {
-                                    playback.toggle_pause();
-                                }
-                                if ui.button("Reset").clicked() {
-                                    playback.reset();
-                                }
-                            });
-                            let history_end = config.simulation.energy_time_bin_us
-                                * config.simulation.energy_time_bins as f32;
-                            ui.add(
-                                egui::Slider::new(&mut playback.time_us, 0.0..=history_end)
-                                    .text("Timeline (µs)"),
-                            );
-                            ui.add(egui::Slider::new(&mut playback.speed, 0.05..=16.0).text("Speed"));
-                            ui.add(
-                                egui::Slider::new(&mut playback.frequency_hz, 1.0..=200_000.0)
-                                    .logarithmic(true)
-                                    .text("Display frequency (Hz)"),
-                            );
-                            ui.label(format!(
-                                "{:.1} / {:.1} µs · {:.2}× · {}",
-                                playback.time_us,
-                                history_end,
-                                playback.speed,
-                                if playback.paused { "paused" } else { "playing" }
                             ));
                         });
 
@@ -356,14 +619,78 @@ pub fn draw(
                 });
         });
 
-    // Draw scene-space previews in the remaining viewport, not in the editor
-    // panel. These are egui overlays, so draft geometry is visible immediately
-    // without rebuilding or touching the GPU transport history.
+    // 4) Timeline and 5) diagnostics/status dock.
+    egui::TopBottomPanel::bottom("val_timeline_diagnostics")
+        .resizable(true)
+        .default_height(142.0)
+        .min_height(105.0)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Timeline");
+                ui.separator();
+                if ui
+                    .button(if playback.paused {
+                        "▶ Play"
+                    } else {
+                        "Ⅱ Pause"
+                    })
+                    .clicked()
+                {
+                    playback.toggle_pause();
+                }
+                if ui.button("↺ Reset").clicked() {
+                    playback.reset();
+                }
+                ui.add(egui::Slider::new(&mut playback.speed, 0.05..=16.0).text("Speed"));
+                ui.add(
+                    egui::Slider::new(&mut playback.frequency_hz, 1.0..=200_000.0)
+                        .logarithmic(true)
+                        .text("Frequency (Hz)"),
+                );
+            });
+            let history_end =
+                config.simulation.energy_time_bin_us * config.simulation.energy_time_bins as f32;
+            ui.add(egui::Slider::new(&mut playback.time_us, 0.0..=history_end).text("Time (µs)"));
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Diagnostics");
+                ui.label(format!(
+                    "{}",
+                    if playback.paused { "Paused" } else { "Playing" }
+                ));
+                ui.separator();
+                ui.label(format!("{} emitters", config.emitters.len()));
+                ui.label(format!("{} material regions", config.materials.len()));
+                ui.label(format!("{} packets / emitter", config.simulation.ray_count));
+                ui.separator();
+                ui.label(status);
+            });
+        });
+
+    // Draw scene-space previews in the central viewport. The three tabs are a
+    // presentation shell: Paths and WaveField map to existing renderer features;
+    // MaterialInterior is intentionally marked as not yet backed by a renderer.
     egui::CentralPanel::default()
         .frame(egui::Frame::none())
         .show(ctx, |ui| {
-            state.viewport_rect = Some(ui.max_rect());
-            draw_scene_preview(ui.painter(), ctx.screen_rect(), camera, config, state);
+            ui.horizontal(|ui| {
+                ui.strong("Viewport");
+                ui.separator();
+                ui.selectable_value(&mut state.viewport_mode, ViewportMode::Paths, "① Packet paths");
+                ui.selectable_value(&mut state.viewport_mode, ViewportMode::WaveField, "② Wave field");
+                ui.selectable_value(&mut state.viewport_mode, ViewportMode::MaterialInterior, "③ Inside material");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label("Perspective · 3D");
+                });
+            });
+            ui.separator();
+            state.debug_show_rays = state.viewport_mode == ViewportMode::Paths;
+            if state.viewport_mode == ViewportMode::MaterialInterior {
+                ui.colored_label(Color32::from_rgb(235, 190, 95), "Material interior view: UI tab is prepared; dedicated material-volume rendering is not implemented yet.");
+            }
+            let viewport = ui.available_rect_before_wrap();
+            state.viewport_rect = Some(viewport);
+            draw_scene_preview(ui.painter(), viewport, camera, config, state);
         });
 
     action
@@ -396,7 +723,14 @@ impl SceneProjection {
         }
         let right = right_delta.normalize();
         let up = right.cross(forward).normalize();
-        if !camera.aspect.is_finite() || camera.aspect <= 0.0 || !camera.fov.is_finite() || camera.fov <= 0.0 {
+        // The HUD docks reduce the actual scene viewport. Its projection must
+        // use the central panel's aspect ratio, not the full window's ratio.
+        let viewport_aspect = rect.width() / rect.height().max(1.0);
+        if !viewport_aspect.is_finite()
+            || viewport_aspect <= 0.0
+            || !camera.fov.is_finite()
+            || camera.fov <= 0.0
+        {
             return None;
         }
         Some(Self {
@@ -404,7 +738,7 @@ impl SceneProjection {
             forward,
             right,
             up,
-            aspect: camera.aspect,
+            aspect: viewport_aspect,
             fov: camera.fov,
             rect,
         })
@@ -454,20 +788,23 @@ impl SceneProjection {
             let t = (near - b.z) / (a.z - b.z);
             b = b.lerp(a, t.clamp(0.0, 1.0));
         }
-        Some([
-            self.project_camera_point(a)?,
-            self.project_camera_point(b)?,
-        ])
+        Some([self.project_camera_point(a)?, self.project_camera_point(b)?])
     }
 }
 
 const BOX_EDGES: [(usize, usize); 12] = [
-    (0, 1), (0, 2), (0, 4),
-    (1, 3), (1, 5),
-    (2, 3), (2, 6),
+    (0, 1),
+    (0, 2),
+    (0, 4),
+    (1, 3),
+    (1, 5),
+    (2, 3),
+    (2, 6),
     (3, 7),
-    (4, 5), (4, 6),
-    (5, 7), (6, 7),
+    (4, 5),
+    (4, 6),
+    (5, 7),
+    (6, 7),
 ];
 
 fn box_corners(min: Vec3, max: Vec3) -> [Vec3; 8] {
@@ -509,7 +846,10 @@ fn draw_wire_box(
         if let Some(points) = projection.project_segment(corners[a], corners[b]) {
             // Multiple strokes form a soft glow with a sharp centre line.
             painter.line_segment(points, Stroke::new(if selected { 8.0 } else { 5.5 }, glow));
-            painter.line_segment(points, Stroke::new(if selected { 3.2 } else { 2.0 }, middle));
+            painter.line_segment(
+                points,
+                Stroke::new(if selected { 3.2 } else { 2.0 }, middle),
+            );
             painter.line_segment(points, Stroke::new(if selected { 1.5 } else { 0.9 }, core));
         }
     }
@@ -552,16 +892,24 @@ fn draw_emitter_marker(
         )
     };
     let radius_m = (emitter.radius_mm * 0.001).max(0.001);
-    let radius_px = (radius_m / (depth * projection.fov) * projection.rect.height() * 0.5)
-        .clamp(4.0, 18.0);
+    let radius_px =
+        (radius_m / (depth * projection.fov) * projection.rect.height() * 0.5).clamp(4.0, 18.0);
 
     painter.circle_stroke(center, radius_px + 2.0, Stroke::new(7.0, glow));
-    painter.circle_stroke(center, radius_px, Stroke::new(if selected { 2.0 } else { 1.4 }, color));
+    painter.circle_stroke(
+        center,
+        radius_px,
+        Stroke::new(if selected { 2.0 } else { 1.4 }, color),
+    );
     painter.circle_stroke(center, radius_px * 0.42, Stroke::new(1.0, color));
     painter.circle_filled(center, if selected { 3.2 } else { 2.4 }, color);
 
     // A short axis line makes the emitter's configured directivity visible.
-    let direction = Vec3::new(emitter.direction[0], emitter.direction[1], emitter.direction[2]);
+    let direction = Vec3::new(
+        emitter.direction[0],
+        emitter.direction[1],
+        emitter.direction[2],
+    );
     if direction.length_squared() > 1.0e-8 {
         let direction_end = center_world + direction.normalize() * (radius_m * 3.0).max(0.006);
         if let Some(points) = projection.project_segment(center_world, direction_end) {
@@ -582,7 +930,11 @@ fn draw_emitter_marker(
     painter.text(
         center + Vec2::new(radius_px + 7.0, -radius_px - 4.0),
         Align2::LEFT_BOTTOM,
-        format!("{} · {:.1} kHz", emitter.name, emitter.frequency_hz / 1000.0),
+        format!(
+            "{} · {:.1} kHz",
+            emitter.name,
+            emitter.frequency_hz / 1000.0
+        ),
         FontId::proportional(12.0),
         color,
     );
@@ -645,7 +997,12 @@ fn draw_scene_preview(
     // All draft emitters remain visible simultaneously. Selection only changes
     // their marker emphasis; it does not move or hide the other source pointers.
     for (index, emitter) in config.emitters.iter().enumerate() {
-        draw_emitter_marker(painter, &projection, emitter, index == state.selected_emitter);
+        draw_emitter_marker(
+            painter,
+            &projection,
+            emitter,
+            index == state.selected_emitter,
+        );
     }
 }
 
@@ -654,7 +1011,10 @@ fn unique_name<'a>(prefix: &str, existing: impl Iterator<Item = &'a str>) -> Str
     let mut suffix = 1u32;
     loop {
         let candidate = format!("{prefix}-{suffix}");
-        if !existing.iter().any(|name| name == &candidate.to_lowercase()) {
+        if !existing
+            .iter()
+            .any(|name| name == &candidate.to_lowercase())
+        {
             return candidate;
         }
         suffix = suffix.saturating_add(1);
@@ -680,7 +1040,6 @@ fn vec3_drag(ui: &mut egui::Ui, label: &str, value: &mut f32, speed: f64) {
         ui.add(egui::DragValue::new(value).speed(speed));
     });
 }
-
 
 #[cfg(test)]
 mod scene_overlay_tests {

@@ -23,8 +23,7 @@ use ui::{UiAction, UiState};
 
 fn material_seed(world_seed: u64, material: &MaterialConfig, index: usize) -> u64 {
     material.seed.unwrap_or_else(|| {
-        world_seed
-            .wrapping_add((index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        world_seed.wrapping_add((index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
     })
 }
 
@@ -37,12 +36,10 @@ fn build_medium(config: &AppConfig, world_dims: [u32; 3]) -> Result<val_felt::Vo
         .map_err(|error| format!("unable to reserve material instances: {error}"))?;
 
     for (index, material) in config.materials.iter().enumerate() {
-        let min: [u32; 3] = std::array::from_fn(|axis| {
-            (material.bounds_min_mm[axis] / voxel_mm).round() as u32
-        });
-        let max: [u32; 3] = std::array::from_fn(|axis| {
-            (material.bounds_max_mm[axis] / voxel_mm).round() as u32
-        });
+        let min: [u32; 3] =
+            std::array::from_fn(|axis| (material.bounds_min_mm[axis] / voxel_mm).round() as u32);
+        let max: [u32; 3] =
+            std::array::from_fn(|axis| (material.bounds_max_mm[axis] / voxel_mm).round() as u32);
         let local_dims = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
 
         let mut laws: Vec<Box<dyn MediumLaw>> = Vec::new();
@@ -97,7 +94,9 @@ fn build_medium(config: &AppConfig, world_dims: [u32; 3]) -> Result<val_felt::Vo
 #[cfg(target_os = "linux")]
 fn available_host_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = meminfo.lines().find(|line| line.starts_with("MemAvailable:"))?;
+    let line = meminfo
+        .lines()
+        .find(|line| line.starts_with("MemAvailable:"))?;
     let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     kib.checked_mul(1024)
 }
@@ -111,11 +110,16 @@ fn report_startup_allocation(config: &AppConfig, world_dims: [u32; 3]) -> Result
     let world_cells = (world_dims[0] as u64)
         .checked_mul(world_dims[1] as u64)
         .and_then(|v| v.checked_mul(world_dims[2] as u64))
-        .ok_or_else(|| "world voxel count overflow; use smaller dimensions or larger voxels".to_string())?;
+        .ok_or_else(|| {
+            "world voxel count overflow; use smaller dimensions or larger voxels".to_string()
+        })?;
     let history_bytes = world_cells
         .checked_mul(config.simulation.energy_time_bins as u64)
         .and_then(|v| v.checked_mul(std::mem::size_of::<u32>() as u64))
-        .ok_or_else(|| "energy-history size overflow; reduce dimensions/bins or increase voxel size".to_string())?;
+        .ok_or_else(|| {
+            "energy-history size overflow; reduce dimensions/bins or increase voxel size"
+                .to_string()
+        })?;
     // Approximate peak host construction: four world f32 arrays, occupancy, and
     // local material arrays. This is a feasibility estimate, never a fixed cap.
     let estimated_host_bytes = world_cells
@@ -183,12 +187,11 @@ fn cursor_over_scene_viewport(
     pixels_per_point: f64,
     viewport: Option<egui::Rect>,
 ) -> bool {
-    let Some(viewport) = viewport else { return false };
+    let Some(viewport) = viewport else {
+        return false;
+    };
     let scale = pixels_per_point.max(f64::EPSILON);
-    let point = egui::pos2(
-        (cursor_pos.0 / scale) as f32,
-        (cursor_pos.1 / scale) as f32,
-    );
+    let point = egui::pos2((cursor_pos.0 / scale) as f32, (cursor_pos.1 / scale) as f32);
     viewport.contains(point)
 }
 
@@ -207,19 +210,32 @@ fn main() {
         std::process::exit(2);
     });
 
-    println!("VAL: {} felt regions + explicit air medium", medium.material_regions.len());
-    println!("world: {:?} voxels at {:.3} mm spacing", world_dims, config.world.voxel_size_mm);
+    println!(
+        "VAL: {} felt regions + explicit air medium",
+        medium.material_regions.len()
+    );
+    println!(
+        "world: {:?} voxels at {:.3} mm spacing",
+        world_dims, config.world.voxel_size_mm
+    );
     for (index, material) in medium.material_regions.iter().enumerate() {
         let settings = &config.materials[index];
         println!(
             "material {}: {:?}..{:?} voxels ({}), sigma_a={:.2} m^-1, sigma_s={:.2} m^-1",
-            material.id, material.min, material.max, material.name,
-            settings.sigma_a_m_inv, settings.sigma_s_m_inv,
+            material.id,
+            material.min,
+            material.max,
+            material.name,
+            settings.sigma_a_m_inv,
+            settings.sigma_s_m_inv,
         );
     }
     println!(
         "{} emitters × {} packets; max {} spatial segments/packet; render {} FPS cap",
-        config.emitters.len(), config.simulation.ray_count, config.simulation.max_steps, config.render.target_fps
+        config.emitters.len(),
+        config.simulation.ray_count,
+        config.simulation.max_steps,
+        config.render.target_fps
     );
     println!(
         "time history: {} bins × {:.1} us = {:.0} us",
@@ -552,6 +568,7 @@ fn main() {
                         textures_delta,
                         full_output.pixels_per_point,
                         ui_state.debug_show_rays,
+                        ui_state.viewport_rect,
                     );
 
                     let title = format!(
@@ -578,14 +595,23 @@ mod input_tests {
 
     #[test]
     fn camera_input_is_routed_only_to_scene_viewport() {
-        let viewport = egui::Rect::from_min_max(
-            egui::pos2(390.0, 0.0),
-            egui::pos2(1180.0, 900.0),
-        );
+        let viewport = egui::Rect::from_min_max(egui::pos2(390.0, 0.0), egui::pos2(1180.0, 900.0));
 
-        assert!(cursor_over_scene_viewport((800.0, 300.0), 1.0, Some(viewport)));
-        assert!(!cursor_over_scene_viewport((200.0, 300.0), 1.0, Some(viewport)));
-        assert!(cursor_over_scene_viewport((1600.0, 600.0), 2.0, Some(viewport)));
+        assert!(cursor_over_scene_viewport(
+            (800.0, 300.0),
+            1.0,
+            Some(viewport)
+        ));
+        assert!(!cursor_over_scene_viewport(
+            (200.0, 300.0),
+            1.0,
+            Some(viewport)
+        ));
+        assert!(cursor_over_scene_viewport(
+            (1600.0, 600.0),
+            2.0,
+            Some(viewport)
+        ));
         assert!(!cursor_over_scene_viewport((800.0, 300.0), 1.0, None));
     }
 }

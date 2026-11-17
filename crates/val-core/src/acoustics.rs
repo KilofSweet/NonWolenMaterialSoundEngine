@@ -114,18 +114,39 @@ mod tests {
 
     #[test]
     fn second_layer_cannot_be_reached_before_serial_first_layer_traversal() {
-        let air_before = PathSegment { distance_m: 0.046, sound_speed_mps: 343.0, sigma_a_m_inv: 0.0 };
-        let first = PathSegment { distance_m: 0.032, sound_speed_mps: 220.0, sigma_a_m_inv: 10.0 };
-        let air_gap = PathSegment { distance_m: 0.004, sound_speed_mps: 343.0, sigma_a_m_inv: 0.0 };
-        let second = PathSegment { distance_m: 0.032, sound_speed_mps: 190.0, sigma_a_m_inv: 28.0 };
+        let air_before = PathSegment {
+            distance_m: 0.046,
+            sound_speed_mps: 343.0,
+            sigma_a_m_inv: 0.0,
+        };
+        let first = PathSegment {
+            distance_m: 0.032,
+            sound_speed_mps: 220.0,
+            sigma_a_m_inv: 10.0,
+        };
+        let air_gap = PathSegment {
+            distance_m: 0.004,
+            sound_speed_mps: 343.0,
+            sigma_a_m_inv: 0.0,
+        };
+        let second = PathSegment {
+            distance_m: 0.032,
+            sound_speed_mps: 190.0,
+            sigma_a_m_inv: 28.0,
+        };
 
         let at_first_exit = integrate_serial_path(1.0, &[air_before, first]);
         let at_second_entry = integrate_serial_path(1.0, &[air_before, first, air_gap]);
         let through_second = integrate_serial_path(1.0, &[air_before, first, air_gap, second]);
 
         assert!(at_second_entry.travel_time_us > at_first_exit.travel_time_us);
-        assert!((at_second_entry.travel_time_us - at_first_exit.travel_time_us
-            - travel_time_us(air_gap.distance_m, air_gap.sound_speed_mps)).abs() < 0.001);
+        assert!(
+            (at_second_entry.travel_time_us
+                - at_first_exit.travel_time_us
+                - travel_time_us(air_gap.distance_m, air_gap.sound_speed_mps))
+            .abs()
+                < 0.001
+        );
         assert!(through_second.travel_time_us > at_second_entry.travel_time_us);
         assert!(through_second.remaining_energy < at_second_entry.remaining_energy);
     }
