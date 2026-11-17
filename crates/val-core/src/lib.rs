@@ -1,4 +1,5 @@
 pub mod acoustics;
+pub mod audio;
 pub mod config;
 
 pub use glam::*;

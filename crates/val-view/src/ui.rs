@@ -8,7 +8,8 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use glam::Vec3;
 use val_core::config::{AppConfig, EmitterConfig, MaterialConfig};
 
-use crate::renderer::CamUniform;
+use crate::audio_workbench::AudioWorkbench;
+use crate::renderer::{CamUniform, EmitterListenerResult};
 use crate::state::PlaybackState;
 
 /// UI-only color themes. These values affect egui styling, never the GPU scene.
@@ -154,6 +155,10 @@ pub enum UiAction {
     None,
     Apply,
     Save,
+    ProcessAudio,
+    ExportListenerCsv,
+    ExportListenerWav,
+    ExportPacketListenerCsv,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -194,6 +199,13 @@ pub struct UiState {
     /// Active viewport presentation tab. Only Paths and WaveField are currently rendered.
     pub viewport_mode: ViewportMode,
     pub theme: UiTheme,
+    pub audio_path: String,
+    pub audio_waveform: Vec<f32>,
+    pub audio_spectrum: Vec<(f32, f32)>,
+    pub audio_summary: String,
+    pub audio_load_requested: bool,
+    pub audio_build_emitters_requested: bool,
+    pub audio_source: Option<crate::audio::AudioSource>,
 }
 
 impl Default for UiState {
@@ -206,6 +218,13 @@ impl Default for UiState {
             debug_show_rays: false,
             viewport_mode: ViewportMode::WaveField,
             theme: UiTheme::load(),
+            audio_path: String::new(),
+            audio_waveform: Vec::new(),
+            audio_spectrum: Vec::new(),
+            audio_summary: "No audio source loaded".into(),
+            audio_load_requested: false,
+            audio_build_emitters_requested: false,
+            audio_source: None,
         }
     }
 }
@@ -217,8 +236,11 @@ pub fn draw(
     state: &mut UiState,
     status: &str,
     camera: &CamUniform,
+    audio: &mut AudioWorkbench,
+    packet_listener: &[EmitterListenerResult],
 ) -> UiAction {
     let mut action = UiAction::None;
+    audio.ensure_default_paths();
     state.theme.apply(ctx);
 
     // 1) Application menu and command toolbar (Blender / CAD-style layout).
@@ -375,6 +397,95 @@ pub fn draw(
                             ));
                         });
 
+                    egui::CollapsingHeader::new("Audio source")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.label("MP3 or PCM WAV recording");
+                            ui.horizontal(|ui| {
+                                if ui.button("Browse…").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("Audio files", &["mp3", "wav"])
+                                        .pick_file()
+                                    {
+                                        state.audio_path = path.display().to_string();
+                                        state.audio_load_requested = true;
+                                    }
+                                }
+                                if ui.button("Load").clicked() {
+                                    state.audio_load_requested = true;
+                                }
+                            });
+                            ui.text_edit_singleline(&mut state.audio_path);
+                            ui.small(&state.audio_summary);
+                            if state.audio_source.is_some()
+                                && ui.button("Create 8-band emitter set").clicked()
+                            {
+                                state.audio_build_emitters_requested = true;
+                            }
+                            ui.small("The 8-band emitter set is a static average-spectrum approximation. The listener audio pass below instead processes the decoded recording as a broadband signal.");
+                            if let Some(clip) = audio.clip.as_ref() {
+                                ui.separator();
+                                ui.small(format!(
+                                    "Listener input ready · {:.2} s · {} Hz · {} channel(s)",
+                                    clip.duration_seconds(), clip.sample_rate_hz, clip.source_channels
+                                ));
+                                if ui.button("Propagate recording through material → listener").clicked() {
+                                    action = UiAction::ProcessAudio;
+                                }
+                            }
+                            if !audio.status.is_empty() {
+                                ui.label(&audio.status);
+                            }
+                            if let Some(capture) = audio.capture.as_ref() {
+                                ui.separator();
+                                ui.label(format!(
+                                    "Travel {:.3} ms · input {:.6} · received {:.6} · lost {:.6}",
+                                    capture.travel_time_seconds * 1000.0,
+                                    capture.total_input_power,
+                                    capture.total_received_power,
+                                    capture.total_lost_power,
+                                ));
+                                draw_listener_spectrum(ui, capture);
+                                ui.label("Reconstructed listener WAV path");
+                                ui.text_edit_singleline(&mut audio.output_wav_path);
+                                if ui.button("Export listener WAV").clicked() {
+                                    action = UiAction::ExportListenerWav;
+                                }
+                                ui.label("Listener spectrum CSV path");
+                                ui.text_edit_singleline(&mut audio.output_csv_path);
+                                if ui.button("Export listener spectrum CSV").clicked() {
+                                    action = UiAction::ExportListenerCsv;
+                                }
+                            }
+                        });
+
+                    egui::CollapsingHeader::new("World listener")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.label("Absorbing receiver position (mm)");
+                            vec3_drag(ui, "X##listener", &mut config.listener.position_mm[0], 0.5);
+                            vec3_drag(ui, "Y##listener", &mut config.listener.position_mm[1], 0.5);
+                            vec3_drag(ui, "Z##listener", &mut config.listener.position_mm[2], 0.5);
+                            ui.label("Face normal (points toward source)");
+                            vec3_drag(ui, "X##listener_normal", &mut config.listener.normal[0], 0.05);
+                            vec3_drag(ui, "Y##listener_normal", &mut config.listener.normal[1], 0.05);
+                            vec3_drag(ui, "Z##listener_normal", &mut config.listener.normal[2], 0.05);
+                            scalar(ui, "Aperture radius (mm)", &mut config.listener.radius_mm, 0.25, 0.1..=1000.0);
+                            ui.small("The listener is an absorbing measurement plane. Captured GPU packet energy is recorded and does not continue beyond the receiver.");
+                        });
+
+                    egui::CollapsingHeader::new("GPU listener capture by emitter frequency")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            draw_packet_listener_capture(ui, packet_listener);
+                            audio.ensure_default_paths();
+                            ui.label("Packet listener CSV path");
+                            ui.text_edit_singleline(&mut audio.output_packet_csv_path);
+                            if ui.button("Export packet listener CSV").clicked() {
+                                action = UiAction::ExportPacketListenerCsv;
+                            }
+                        });
+
                     egui::CollapsingHeader::new("Sound emitters")
                         .default_open(true)
                         .show(ui, |ui| {
@@ -517,6 +628,8 @@ pub fn draw(
                                 scalar(ui, "Bulk density (kg/m³)", &mut material.density_kg_m3, 1.0, 0.1..=10_000.0);
                                 scalar(ui, "Effective density (kg/m³)", &mut material.effective_density_kg_m3, 0.05, 0.1..=100.0);
                                 scalar(ui, "Porosity", &mut material.porosity, 0.01, 0.0..=1.0);
+                                scalar(ui, "Absorption frequency exponent", &mut material.absorption_frequency_exponent, 0.01, -2.0..=4.0);
+                                scalar(ui, "Scattering frequency exponent", &mut material.scattering_frequency_exponent, 0.01, -2.0..=4.0);
                                 ui.separator();
                                 ui.label("Structure laws");
                                 egui::ComboBox::from_id_source("gradient_axis")
@@ -533,6 +646,17 @@ pub fn draw(
                                 ui.label("Appearance");
                                 ui.color_edit_button_rgb(&mut material.visual_color);
                                 scalar(ui, "Base opacity", &mut material.visual_opacity, 0.001, 0.0..=1.0);
+                                egui::ComboBox::from_id_source("material_texture_pattern")
+                                    .selected_text(["Non-woven felt", "Woven", "Smooth", "Random fibres"][material.texture_pattern.min(3) as usize])
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut material.texture_pattern, 0, "Non-woven felt");
+                                        ui.selectable_value(&mut material.texture_pattern, 1, "Woven");
+                                        ui.selectable_value(&mut material.texture_pattern, 2, "Smooth");
+                                        ui.selectable_value(&mut material.texture_pattern, 3, "Random fibres");
+                                    });
+                                scalar(ui, "Fibre scale (mm)", &mut material.texture_scale_mm, 0.05, 0.05..=50.0);
+                                scalar(ui, "Texture contrast", &mut material.texture_strength, 0.01, 0.0..=1.0);
+                                scalar(ui, "Fibre direction (deg)", &mut material.texture_direction_degrees, 1.0, -360.0..=360.0);
                             }
                             ui.small("Material geometry and transport coefficients are regenerated on Apply.");
                         });
@@ -548,6 +672,7 @@ pub fn draw(
                             scalar(ui, "Air sound speed (m/s)", &mut config.world.air_speed_mps, 1.0, 100.0..=500.0);
                             scalar(ui, "Air density (kg/m³)", &mut config.world.air_density_kg_m3, 0.01, 0.1..=10.0);
                             scalar(ui, "Air absorption (m⁻¹)", &mut config.world.air_absorption_m_inv, 0.01, 0.0..=100.0);
+                            scalar(ui, "Air absorption frequency exponent", &mut config.world.air_absorption_frequency_exponent, 0.01, -2.0..=4.0);
                             ui.add(egui::DragValue::new(&mut config.world.seed).prefix("Seed "));
                         });
 
@@ -691,6 +816,50 @@ pub fn draw(
             let viewport = ui.available_rect_before_wrap();
             state.viewport_rect = Some(viewport);
             draw_scene_preview(ui.painter(), viewport, camera, config, state);
+            if !state.audio_waveform.is_empty() {
+                let graph_h = 82.0;
+                let graph = Rect::from_min_size(
+                    Pos2::new(viewport.left() + 12.0, viewport.bottom() - graph_h - 12.0),
+                    Vec2::new((viewport.width() - 24.0).max(80.0), graph_h),
+                );
+                ui.painter().rect_filled(graph, 5.0, Color32::from_black_alpha(175));
+                ui.painter().text(
+                    graph.left_top() + Vec2::new(8.0, 5.0),
+                    egui::Align2::LEFT_TOP,
+                    "AUDIO SOURCE · decoded waveform",
+                    FontId::proportional(10.0),
+                    Color32::from_rgb(125, 190, 220),
+                );
+                let mid = graph.top() + 30.0;
+                let amp = 13.0;
+                let points: Vec<Pos2> = state.audio_waveform.iter().enumerate().map(|(i, v)| {
+                    Pos2::new(
+                        graph.left() + 7.0 + i as f32 / (state.audio_waveform.len().saturating_sub(1).max(1)) as f32 * (graph.width() - 14.0),
+                        mid - v.clamp(0.0, 1.0) * amp,
+                    )
+                }).collect();
+                ui.painter().add(egui::Shape::line(points, Stroke::new(1.4, Color32::from_rgb(70, 205, 190))));
+                if !state.audio_spectrum.is_empty() {
+                    let bar_gap = 3.0;
+                    let bar_width = ((graph.width() - 18.0) / state.audio_spectrum.len() as f32 - bar_gap).max(2.0);
+                    for (index, (frequency, level)) in state.audio_spectrum.iter().enumerate() {
+                        let x = graph.left() + 9.0 + index as f32 * (bar_width + bar_gap);
+                        let h = level.clamp(0.0, 1.0) * 19.0;
+                        let rect = Rect::from_min_size(
+                            Pos2::new(x, graph.bottom() - 8.0 - h),
+                            Vec2::new(bar_width, h.max(1.0)),
+                        );
+                        ui.painter().rect_filled(rect, 2.0, Color32::from_rgb(225, 145, 75));
+                        ui.painter().text(
+                            Pos2::new(x + bar_width * 0.5, graph.bottom() - 6.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            format!("{:.0}", frequency),
+                            FontId::proportional(7.0),
+                            Color32::LIGHT_GRAY,
+                        );
+                    }
+                }
+            }
         });
 
     action
@@ -1004,7 +1173,157 @@ fn draw_scene_preview(
             index == state.selected_emitter,
         );
     }
+
+    let listener_world = Vec3::new(
+        config.listener.position_mm[0] * 0.001,
+        config.listener.position_mm[1] * 0.001,
+        config.listener.position_mm[2] * 0.001,
+    );
+    if let Some((center, depth)) = projection.project(listener_world) {
+        let radius = (config.listener.radius_mm * 0.001
+            / (depth * projection.fov)
+            * projection.rect.height()
+            * 0.5)
+            .clamp(5.0, 22.0);
+        let color = Color32::from_rgb(125, 235, 165);
+        painter.circle_stroke(
+            center,
+            radius + 3.0,
+            Stroke::new(5.0, Color32::from_rgba_unmultiplied(85, 225, 140, 70)),
+        );
+        painter.circle_stroke(center, radius, Stroke::new(1.8, color));
+        painter.line_segment(
+            [center - Vec2::new(radius * 0.65, radius * 0.65), center + Vec2::new(radius * 0.65, radius * 0.65)],
+            Stroke::new(1.5, color),
+        );
+        painter.line_segment(
+            [center - Vec2::new(radius * 0.65, -radius * 0.65), center + Vec2::new(radius * 0.65, -radius * 0.65)],
+            Stroke::new(1.5, color),
+        );
+        painter.text(
+            center + Vec2::new(radius + 6.0, -radius - 3.0),
+            Align2::LEFT_BOTTOM,
+            "LISTENER",
+            FontId::proportional(12.0),
+            color,
+        );
+    }
 }
+
+fn draw_packet_listener_capture(ui: &mut egui::Ui, results: &[EmitterListenerResult]) {
+    if results.is_empty() {
+        ui.small("No packet listener captures available. Configure an emitter and rebuild the transport solve.");
+        return;
+    }
+    for result in results {
+        ui.horizontal(|ui| {
+            ui.label(format!("{} · {:.1} kHz", result.name, result.frequency_hz / 1000.0));
+            ui.label(format!("{:.4}%", result.transmission_percent));
+        });
+        ui.add(
+            egui::ProgressBar::new((result.transmission_percent / 100.0).clamp(0.0, 1.0))
+                .show_percentage(),
+        );
+        ui.small(format!(
+            "Emitted {:.6} · received {:.6} · lost {:.6} (relative energy units)",
+            result.emitted_power,
+            result.received_power,
+            (result.emitted_power - result.received_power).max(0.0),
+        ));
+    }
+}
+
+fn draw_listener_spectrum(ui: &mut egui::Ui, capture: &crate::spectral::ListenerCapture) {
+    ui.label("Listener transmission versus frequency (dB)");
+    let desired = Vec2::new(ui.available_width().max(160.0), 132.0);
+    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, Color32::from_rgb(18, 23, 31));
+    let left = rect.left() + 34.0;
+    let right = rect.right() - 8.0;
+    let top = rect.top() + 8.0;
+    let bottom = rect.bottom() - 20.0;
+    let plot = Rect::from_min_max(Pos2::new(left, top), Pos2::new(right, bottom));
+    for tick in 0..=4 {
+        let y = plot.bottom() - tick as f32 * plot.height() / 4.0;
+        painter.line_segment([Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)], Stroke::new(1.0f32, Color32::from_gray(48)));
+        painter.text(Pos2::new(rect.left() + 2.0, y), Align2::LEFT_CENTER, format!("-{}", (4 - tick) * 20), FontId::proportional(9.0), Color32::GRAY);
+    }
+    painter.text(Pos2::new(plot.left(), rect.bottom() - 3.0), Align2::LEFT_BOTTOM, "0 Hz", FontId::proportional(9.0), Color32::GRAY);
+    painter.text(Pos2::new(plot.right(), rect.bottom() - 3.0), Align2::RIGHT_BOTTOM, "Nyquist", FontId::proportional(9.0), Color32::GRAY);
+
+    let transmission = &capture.spectrum.transmission_db;
+    if transmission.len() >= 2 {
+        let stride = ((transmission.len() - 1) / 512).max(1);
+        let mut points = Vec::new();
+        for index in (0..transmission.len()).step_by(stride) {
+            let x = plot.left() + index as f32 / (transmission.len() - 1) as f32 * plot.width();
+            let db = transmission[index].clamp(-80.0, 0.0);
+            let y = plot.bottom() - (db + 80.0) / 80.0 * plot.height();
+            points.push(Pos2::new(x, y));
+        }
+        if points.len() >= 2 {
+            painter.add(egui::Shape::line(points, Stroke::new(1.7f32, Color32::from_rgb(115, 215, 255))));
+        }
+    }
+    ui.small("0 dB = unchanged power; -80 dB = near silence");
+
+    ui.add_space(5.0);
+    ui.label("Input, received and lost spectral power (relative scale)");
+    let (power_rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let power_painter = ui.painter_at(power_rect);
+    power_painter.rect_filled(power_rect, 3.0, Color32::from_rgb(18, 23, 31));
+    let power_plot = Rect::from_min_max(
+        Pos2::new(power_rect.left() + 34.0, power_rect.top() + 8.0),
+        Pos2::new(power_rect.right() - 8.0, power_rect.bottom() - 20.0),
+    );
+    for tick in 0..=4 {
+        let y = power_plot.bottom() - tick as f32 * power_plot.height() / 4.0;
+        power_painter.line_segment(
+            [Pos2::new(power_plot.left(), y), Pos2::new(power_plot.right(), y)],
+            Stroke::new(1.0f32, Color32::from_gray(48)),
+        );
+        power_painter.text(
+            Pos2::new(power_rect.left() + 2.0, y),
+            Align2::LEFT_CENTER,
+            format!("-{}", (4 - tick) * 20),
+            FontId::proportional(9.0),
+            Color32::GRAY,
+        );
+    }
+    power_painter.text(Pos2::new(power_plot.left(), power_rect.bottom() - 3.0), Align2::LEFT_BOTTOM, "0 Hz", FontId::proportional(9.0), Color32::GRAY);
+    power_painter.text(Pos2::new(power_plot.right(), power_rect.bottom() - 3.0), Align2::RIGHT_BOTTOM, "Nyquist", FontId::proportional(9.0), Color32::GRAY);
+
+    let max_power = capture.spectrum.input_power.iter().copied().fold(0.0f32, f32::max).max(1e-30);
+    let curves: [(&[f32], Color32); 3] = [
+        (&capture.spectrum.input_power, Color32::from_rgb(255, 203, 92)),
+        (&capture.spectrum.received_power, Color32::from_rgb(105, 220, 160)),
+        (&capture.spectrum.lost_power, Color32::from_rgb(255, 112, 112)),
+    ];
+    let point_count = capture.spectrum.frequency_hz.len();
+    if point_count >= 2 {
+        let stride = ((point_count - 1) / 512).max(1);
+        for (values, color) in curves {
+            let mut points = Vec::new();
+            for index in (0..values.len().min(point_count)).step_by(stride) {
+                let x = power_plot.left() + index as f32 / (point_count - 1) as f32 * power_plot.width();
+                let relative = (values[index].max(1e-30) / max_power).log10().clamp(-8.0, 0.0);
+                let y = power_plot.bottom() - (relative + 8.0) / 8.0 * power_plot.height();
+                points.push(Pos2::new(x, y));
+            }
+            if points.len() >= 2 {
+                power_painter.add(egui::Shape::line(points, Stroke::new(1.5f32, color)));
+            }
+        }
+    }
+    ui.horizontal(|ui| {
+        ui.colored_label(Color32::from_rgb(255, 203, 92), "Input");
+        ui.colored_label(Color32::from_rgb(105, 220, 160), "Received");
+        ui.colored_label(Color32::from_rgb(255, 112, 112), "Lost");
+    });
+    ui.small("Power curves use a logarithmic dB scale relative to the strongest input bin.");
+}
+
 
 fn unique_name<'a>(prefix: &str, existing: impl Iterator<Item = &'a str>) -> String {
     let existing: Vec<String> = existing.map(|name| name.to_lowercase()).collect();

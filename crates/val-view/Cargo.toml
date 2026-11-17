@@ -16,3 +16,7 @@ half = "1.8"
 egui = "0.28"
 egui-winit = "0.28"
 egui-wgpu = "0.28"
+
+# MP3 frame decoder for imported acoustic source recordings.
+minimp3 = "0.5"
+rfd = "0.14"

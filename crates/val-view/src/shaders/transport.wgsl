@@ -5,6 +5,8 @@ struct SolveParams {
     spacing: f32,
     src: vec4<f32>,                  // xyz = source position, w = transport step (m)
     source_dir: vec4<f32>,           // xyz = cone axis, w = cos(half angle)
+    listener_position_radius: vec4<f32>, // xyz = absorbing aperture center, w = radius
+    listener_normal: vec4<f32>,      // xyz = face normal toward source
     max_steps: u32,
     num_rays: u32,
     material_count: u32,
@@ -13,6 +15,10 @@ struct SolveParams {
     air_speed_mps: f32,
     air_density_kg_m3: f32,
     air_absorption_m_inv: f32,
+    frequency_hz: f32,
+    air_absorption_frequency_exponent: f32,
+    frequency_channel: u32,
+    _frequency_padding: u32,
     time_bin_us: f32,
     time_bin_count: u32,
     energy_scale: f32,
@@ -34,6 +40,7 @@ struct MaterialBounds {
     min: vec4<u32>,                  // xyz = inclusive minimum voxel coordinate
     max: vec4<u32>,                  // xyz = exclusive maximum voxel coordinate
     properties: vec4<f32>,           // x = effective density; y/z = mean sigma_a/s; w = mean c
+    spectral: vec4<f32>,             // x = absorption exponent; y = scattering exponent
 };
 
 struct BoundaryResult {
@@ -47,6 +54,7 @@ struct BoundaryResult {
 @group(0) @binding(3) var<uniform> params: SolveParams;
 @group(0) @binding(4) var<storage, read> material_bounds: array<MaterialBounds>;
 @group(0) @binding(5) var<storage, read_write> debug_segments: array<DebugRaySegment>;
+@group(0) @binding(6) var<storage, read_write> listener_capture: array<atomic<u32>>;
 
 const EPS: f32 = 0.000002;
 const TINY: f32 = 0.0000001;
@@ -175,11 +183,33 @@ fn deposit_voxel_energy(
             let contribution = packet_energy * (segment_length / params.spacing) * params.energy_scale;
             if (contribution > 0.5) {
                 let fixed_point = u32(min(round(contribution), 4294967040.0));
-                let histogram_index = cell_index * params.time_bin_count + bin;
+                let world_cells = params.dim_x * params.dim_y * params.dim_z;
+                let channel_stride = world_cells * params.time_bin_count;
+                let histogram_index = params.frequency_channel * channel_stride
+                    + cell_index * params.time_bin_count + bin;
                 atomicAdd(&energy_hist[histogram_index], fixed_point);
             }
         }
     }
+}
+
+// Return the distance to the listener plane when a packet crosses its
+// source-facing circular aperture during the current transport segment.
+// A successful hit is absorbing: the caller records energy and terminates it.
+fn listener_hit_distance(start: vec3<f32>, direction: vec3<f32>, max_distance: f32) -> f32 {
+    let normal = normalize(params.listener_normal.xyz);
+    let facing = dot(direction, normal);
+    if (facing >= -0.0001) { return -1.0; }
+    let center = params.listener_position_radius.xyz;
+    let distance = dot(center - start, normal) / facing;
+    if (distance <= EPS || distance > max_distance) { return -1.0; }
+    let hit = start + direction * distance;
+    let offset = hit - center;
+    let tangent_offset = offset - normal * dot(offset, normal);
+    if (dot(tangent_offset, tangent_offset) <= params.listener_position_radius.w * params.listener_position_radius.w) {
+        return distance;
+    }
+    return -1.0;
 }
 
 fn record_debug_segment(
@@ -286,14 +316,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     packet_energy / max(params.source_energy / f32(params.num_rays), 0.000000001),
                 );
             }
+            let frequency_ratio = clamp(max(params.frequency_hz, 1.0) / 1000.0, 0.001, 1000.0);
+            let air_absorption = max(params.air_absorption_m_inv, 0.0)
+                * pow(frequency_ratio, clamp(params.air_absorption_frequency_exponent, -2.0, 4.0));
+            let listener_distance = listener_hit_distance(segment_start, dir, segment_length);
+            if (listener_distance > 0.0) {
+                let received = packet_energy * exp(-air_absorption * listener_distance);
+                let capture_fixed = u32(min(max(round(received * params.energy_scale), 0.0), 4294967040.0));
+                if (capture_fixed > 0u) { atomicAdd(&listener_capture[params.frequency_channel], capture_fixed); }
+                time_us += listener_distance / max(params.air_speed_mps, 1.0) * 1000000.0;
+                break;
+            }
             let sample_position = segment_start + dir * (segment_length * 0.5);
             let midpoint_time = time_us + segment_length / (2.0 * max(params.air_speed_mps, 1.0)) * 1000000.0;
             let energy_at_midpoint = packet_energy
-                * exp(-max(params.air_absorption_m_inv, 0.0) * segment_length * 0.5);
+                * exp(-air_absorption * segment_length * 0.5);
             deposit_voxel_energy(sample_position, energy_at_midpoint, midpoint_time, segment_length);
 
             time_us += segment_length / max(params.air_speed_mps, 1.0) * 1000000.0;
-            packet_energy *= exp(-max(params.air_absorption_m_inv, 0.0) * segment_length);
+            packet_energy *= exp(-air_absorption * segment_length);
             pos = segment_start + dir * segment_length;
 
             if (segment_length >= boundary_distance - EPS) {
@@ -347,15 +388,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 packet_energy / max(params.source_energy / f32(params.num_rays), 0.000000001),
             );
         }
+        let listener_distance = listener_hit_distance(segment_start, dir, segment_length);
+        if (listener_distance > 0.0) {
+            let listener_sample = segment_start + dir * listener_distance;
+            let medium_at_listener = sample_medium(listener_sample);
+            let listener_absorption = max(medium_at_listener.x, 0.0)
+                * pow(clamp(max(params.frequency_hz, 1.0) / 1000.0, 0.001, 1000.0), clamp(region.spectral.x, -2.0, 4.0));
+            let received = packet_energy * exp(-listener_absorption * listener_distance);
+            let capture_fixed = u32(min(max(round(received * params.energy_scale), 0.0), 4294967040.0));
+            if (capture_fixed > 0u) { atomicAdd(&listener_capture[params.frequency_channel], capture_fixed); }
+            time_us += listener_distance / max(medium_at_listener.w, 20.0) * 1000000.0;
+            break;
+        }
         let sample_position = pos + dir * (segment_length * 0.5);
         let medium = sample_medium(sample_position);
         let local_speed = max(medium.w, 20.0);
-        let energy_at_midpoint = packet_energy * exp(-max(medium.x, 0.0) * segment_length * 0.5);
+        let frequency_ratio = clamp(max(params.frequency_hz, 1.0) / 1000.0, 0.001, 1000.0);
+        let effective_absorption = max(medium.x, 0.0)
+            * pow(frequency_ratio, clamp(region.spectral.x, -2.0, 4.0));
+        let effective_scattering = max(medium.y, 0.0)
+            * pow(frequency_ratio, clamp(region.spectral.y, -2.0, 4.0));
+        let energy_at_midpoint = packet_energy * exp(-effective_absorption * segment_length * 0.5);
         let midpoint_time = time_us + segment_length / (2.0 * local_speed) * 1000000.0;
         deposit_voxel_energy(sample_position, energy_at_midpoint, midpoint_time, segment_length);
 
         time_us += segment_length / local_speed * 1000000.0;
-        packet_energy *= exp(-max(medium.x, 0.0) * segment_length);
+        packet_energy *= exp(-effective_absorption * segment_length);
         pos += dir * segment_length;
 
         if (segment_length >= distance_to_exit - EPS) {
@@ -387,7 +445,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         // Scattering redirects packets inside the current material; absorption
         // has already reduced their energy through the local sigma_a coefficient.
-        let scatter_probability = 1.0 - exp(-max(medium.y, 0.0) * segment_length);
+        let scatter_probability = 1.0 - exp(-effective_scattering * segment_length);
         if (scatter_probability > 0.0) {
             rng = advance_rng(rng);
             let r0 = random_from_state(rng);

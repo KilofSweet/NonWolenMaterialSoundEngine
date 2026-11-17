@@ -67,11 +67,11 @@ density_kg_m3 = 180.0
 effective_density_kg_m3 = 1.8
 porosity = 0.82
 visual_color = [0.95, 0.43, 0.12]
-visual_opacity = 0.012
+visual_opacity = 0.065
 # Omit seed to derive it deterministically from world.seed and material order.
 gradient_axis = 1
-gradient_strength = 0.5
-clump_scale_per_m = 150.0
+gradient_strength = 1.35
+clump_scale_per_m = 240.0
 clump_strength = 0.8
 
 # Add a second independent felt instance by adding another [[materials]] block.

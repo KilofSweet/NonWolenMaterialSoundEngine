@@ -7,7 +7,13 @@ voxel_size_mm = 1.0
 air_speed_mps = 343.0
 air_density_kg_m3 = 1.204
 air_absorption_m_inv = 0.0
+air_absorption_frequency_exponent = 0.5
 seed = 7
+
+[listener]
+position_mm = [120.0, 48.0, 48.0]
+normal = [-1.0, 0.0, 0.0]
+radius_mm = 12.0
 
 [[emitters]]
 name = "main-emitter"
@@ -28,9 +34,8 @@ ray_count = 131072
 max_steps = 512
 step_mm = 0.75
 timeline_rate_us_per_second = 60.0
-# Full-world time histogram: air and every material share one voxel/time field.
-# 24 x 20 us = 480 us history. Smaller bins improve temporal detail; more bins
-# extend playback history at a proportional GPU memory cost.
+# Each emitter frequency has its own full-world time histogram channel.
+# 24 x 20 us = 480 us history per emitter. Memory scales with emitter count.
 energy_time_bin_us = 20.0
 energy_time_bins = 24
 
@@ -60,7 +65,7 @@ energy_hot_color = [1.0, 0.88, 0.42]
 [[materials]]
 name = "warm-felt"
 bounds_min_mm = [64.0, 16.0, 16.0]
-bounds_max_mm = [128.0, 80.0, 80.0]
+bounds_max_mm = [112.0, 80.0, 80.0]
 sigma_a_m_inv = 60.0
 sigma_s_m_inv = 8.0
 anisotropy_g = 0.55
@@ -70,8 +75,14 @@ density_kg_m3 = 180.0
 # This is distinct from bulk density and should be measured/calibrated for real samples.
 effective_density_kg_m3 = 1.8
 porosity = 0.82
+absorption_frequency_exponent = 0.5
+scattering_frequency_exponent = 0.7
 visual_color = [0.95, 0.43, 0.12]
 visual_opacity = 0.012
+texture_pattern = 0
+texture_scale_mm = 0.9
+texture_strength = 0.72
+texture_direction_degrees = 0.0
 # Omit seed to derive it deterministically from world.seed and material order.
 gradient_axis = 1
 gradient_strength = 0.5
@@ -79,17 +90,17 @@ clump_scale_per_m = 150.0
 clump_strength = 0.8
 
 # SERIAL-LAYER EXAMPLE (important):
-# The active warm-felt block above currently spans X=64..128 mm.
+# The active warm-felt block above currently spans X=64..112 mm.
 # To put a second material BEHIND it along the +X source direction, first
 # change warm-felt.bounds_max_mm to [96.0, 80.0, 80.0]. Then uncomment the
-# following block, which occupies X=96..128 mm. Do not use X=24..48 here:
+# following block, which occupies X=96..112 mm, leaving air for the listener. Do not use X=24..48 here:
 # that would place the second block BEFORE the current felt, between source
 # and felt, and it would correctly be reached first.
 #
 # [[materials]]
 # name = "dense-felt-behind"
 # bounds_min_mm = [96.0, 16.0, 16.0]
-# bounds_max_mm = [128.0, 80.0, 80.0]
+# bounds_max_mm = [112.0, 80.0, 80.0]
 # sigma_a_m_inv = 28.0
 # sigma_s_m_inv = 85.0
 # anisotropy_g = 0.35
@@ -99,6 +110,10 @@ clump_strength = 0.8
 # porosity = 0.68
 # visual_color = [0.18, 0.72, 0.82]
 # visual_opacity = 0.035
+# texture_pattern = 0
+# texture_scale_mm = 0.9
+# texture_strength = 0.72
+# texture_direction_degrees = 0.0
 # seed = 991
 # gradient_axis = 0
 # gradient_strength = 0.2

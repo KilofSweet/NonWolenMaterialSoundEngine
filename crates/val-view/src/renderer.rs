@@ -1,8 +1,8 @@
 use crate::shaders;
-use half::f16;
 use std::sync::Arc;
 use val_core::config::AppConfig;
 use val_felt::VoxelMedium;
+use half::f16;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -31,6 +31,8 @@ struct SolveParams {
     spacing: f32,
     src: [f32; 4],
     source_dir: [f32; 4],
+    listener_position_radius: [f32; 4],
+    listener_normal: [f32; 4],
     max_steps: u32,
     num_rays: u32,
     material_count: u32,
@@ -39,6 +41,10 @@ struct SolveParams {
     air_speed_mps: f32,
     air_density_kg_m3: f32,
     air_absorption_m_inv: f32,
+    frequency_hz: f32,
+    air_absorption_frequency_exponent: f32,
+    frequency_channel: u32,
+    _frequency_padding: u32,
     time_bin_us: f32,
     time_bin_count: u32,
     energy_scale: f32,
@@ -134,7 +140,7 @@ impl PlayUniform {
                 config.visualization.energy_hot_color[2],
                 config.visualization.air_wave_max_opacity,
             ],
-            history_counts: [config.simulation.energy_time_bins, 0, 0, 0],
+            history_counts: [config.simulation.energy_time_bins, emitter_index as u32, config.emitters.len() as u32, 0],
         }
     }
 }
@@ -148,6 +154,8 @@ struct MaterialBoundsGpu {
     max: [u32; 4],
     /// x = effective density, y = mean absorption, z = mean scattering, w = mean sound speed
     properties: [f32; 4],
+    /// x=absorption exponent, y=scattering exponent, z/w reserved.
+    spectral: [f32; 4],
 }
 
 const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -158,6 +166,15 @@ struct SceneTarget {
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmitterListenerResult {
+    pub name: String,
+    pub frequency_hz: f32,
+    pub emitted_power: f32,
+    pub received_power: f32,
+    pub transmission_percent: f32,
 }
 
 pub struct Renderer {
@@ -172,6 +189,8 @@ pub struct Renderer {
     _energy_display_texture: wgpu::Texture,
     energy_display_workgroups: [u32; 3],
     last_energy_time_bits: Option<u32>,
+    last_energy_channel: Option<u32>,
+    pub listener_results: Vec<EmitterListenerResult>,
     _debug_segment_buffer: wgpu::Buffer,
     debug_segment_bind: wgpu::BindGroup,
     debug_ray_pipeline: wgpu::RenderPipeline,
@@ -218,11 +237,7 @@ impl Renderer {
         .unwrap();
 
         let device_limits = device.limits();
-        if medium
-            .dim
-            .iter()
-            .any(|d| *d > device_limits.max_texture_dimension_3d)
-        {
+        if medium.dim.iter().any(|d| *d > device_limits.max_texture_dimension_3d) {
             panic!(
                 "VAL allocation cannot fit this GPU: world texture {:?} exceeds max_texture_dimension_3d={}. Reduce world dimensions or increase voxel_size_mm.",
                 medium.dim, device_limits.max_texture_dimension_3d
@@ -243,9 +258,8 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let med_data = pack_medium_texture(medium).unwrap_or_else(|error| {
-            panic!("VAL host allocation failed while packing material texture: {error}")
-        });
+        let med_data = pack_medium_texture(medium)
+            .unwrap_or_else(|error| panic!("VAL host allocation failed while packing material texture: {error}"));
         let med_row_pitch = align_to(medium.dim[0] * 8, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let med_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -264,11 +278,7 @@ impl Renderer {
         });
         device.poll(wgpu::Maintain::Wait);
         if let Some(error) = pollster::block_on(device.pop_error_scope()) {
-            panic!(
-                "VAL GPU allocation failed for {:?} RGBA16F medium texture ({:.1} MiB): {error}",
-                medium.dim,
-                med_data.len() as f64 / 1_048_576.0
-            );
+            panic!("VAL GPU allocation failed for {:?} RGBA16F medium texture ({:.1} MiB): {error}", medium.dim, med_data.len() as f64 / 1_048_576.0);
         }
         queue.write_texture(
             wgpu::ImageCopyTexture {
@@ -312,6 +322,12 @@ impl Renderer {
                     region.sigma_s_mean,
                     region.sound_speed_mean,
                 ],
+                spectral: [
+                    region.absorption_frequency_exponent,
+                    region.scattering_frequency_exponent,
+                    0.0,
+                    0.0,
+                ],
             });
         }
         let world_cells = (medium.dim[0] as u64)
@@ -321,7 +337,8 @@ impl Renderer {
         let energy_bins = app_config.simulation.energy_time_bins as u64;
         let energy_entries = world_cells
             .checked_mul(energy_bins)
-            .expect("VAL energy history element count overflow");
+            .and_then(|entries| entries.checked_mul(app_config.emitters.len() as u64))
+            .expect("VAL frequency-channel energy history element count overflow");
         let energy_bytes = energy_entries
             .checked_mul(std::mem::size_of::<u32>() as u64)
             .expect("VAL energy history byte count overflow");
@@ -340,8 +357,7 @@ impl Renderer {
             &device,
             energy_bytes,
             "world_air_and_material_energy_time_histogram",
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
+        ).unwrap_or_else(|error| panic!("{error}"));
 
         // Per-frame energy reduction texture. The fragment shader reads one
         // value per voxel rather than looping over histogram bins for every
@@ -363,13 +379,9 @@ impl Renderer {
         });
         device.poll(wgpu::Maintain::Wait);
         if let Some(error) = pollster::block_on(device.pop_error_scope()) {
-            panic!(
-                "VAL GPU allocation failed for time-filtered energy texture {:?}: {error}",
-                medium.dim
-            );
+            panic!("VAL GPU allocation failed for time-filtered energy texture {:?}: {error}", medium.dim);
         }
-        let energy_display_view =
-            energy_display_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let energy_display_view = energy_display_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let energy_display_workgroups = [
             (medium.dim[0] + 3) / 4,
             (medium.dim[1] + 3) / 4,
@@ -388,7 +400,7 @@ impl Renderer {
             .checked_mul(std::mem::size_of::<MaterialBoundsGpu>() as u64)
             .expect("material bounds buffer size overflow");
         let material_visuals_bytes = (medium.material_regions.len() as u64)
-            .checked_mul(std::mem::size_of::<[f32; 4]>() as u64)
+            .checked_mul(2 * std::mem::size_of::<[f32; 4]>() as u64)
             .expect("material visuals buffer size overflow");
         for (label, bytes) in [
             ("material bounds", material_bounds_bytes),
@@ -411,9 +423,7 @@ impl Renderer {
             .min((u32::MAX / 2) as u64);
         let emitter_count_u64 = app_config.emitters.len() as u64;
         let entries_per_emitter = debug_capacity_entries / emitter_count_u64.max(1);
-        let debug_segments_per_ray = (app_config
-            .simulation
-            .max_steps
+        let debug_segments_per_ray = (app_config.simulation.max_steps
             .min(DEBUG_MAX_SEGMENTS_PER_RAY)
             .max(1) as u64)
             .min(entries_per_emitter.max(1)) as u32;
@@ -421,8 +431,7 @@ impl Renderer {
             0
         } else {
             (ray_count.min(DEBUG_RAYS_PER_EMITTER) as u64)
-                .min((entries_per_emitter / debug_segments_per_ray as u64).max(1))
-                as u32
+                .min((entries_per_emitter / debug_segments_per_ray as u64).max(1)) as u32
         };
         let debug_entry_count = emitter_count_u64
             .checked_mul(debug_rays_per_emitter as u64)
@@ -437,6 +446,20 @@ impl Renderer {
         {
             panic!("VAL debug-ray buffer exceeds the selected GPU's storage-buffer limits");
         }
+        let listener_capture_bytes = (app_config.emitters.len() as u64)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
+            .expect("listener capture buffer size overflow");
+        if listener_capture_bytes > device_limits.max_storage_buffer_binding_size as u64
+            || listener_capture_bytes > device_limits.max_buffer_size
+        {
+            panic!("VAL listener capture buffer exceeds the selected GPU's storage-buffer limits");
+        }
+        let listener_capture_buffer = create_zeroed_storage_buffer(
+            &device,
+            listener_capture_bytes.max(4),
+            "absorbing_world_listener_per_frequency_capture",
+        ).unwrap_or_else(|error| panic!("{error}"));
+
         let debug_segment_buffer = create_zeroed_storage_buffer(
             &device,
             debug_buffer_bytes,
@@ -452,9 +475,7 @@ impl Renderer {
         }
 
         let step_m = app_config.simulation.step_mm * 0.001;
-        let total_amplitude = app_config
-            .emitters
-            .iter()
+        let total_amplitude = app_config.emitters.iter()
             .map(|emitter| emitter.amplitude as f64)
             .sum::<f64>();
         // Keep the aggregate fixed-point histogram in a stable visual range as
@@ -488,6 +509,18 @@ impl Renderer {
                         direction[2] / direction_len,
                         emitter.cone_half_angle_degrees.to_radians().cos(),
                     ],
+                    listener_position_radius: [
+                        app_config.listener.position_mm[0] * 0.001,
+                        app_config.listener.position_mm[1] * 0.001,
+                        app_config.listener.position_mm[2] * 0.001,
+                        app_config.listener.radius_mm * 0.001,
+                    ],
+                    listener_normal: [
+                        app_config.listener.normal[0],
+                        app_config.listener.normal[1],
+                        app_config.listener.normal[2],
+                        0.0,
+                    ],
                     max_steps: app_config.simulation.max_steps,
                     num_rays: ray_count,
                     material_count: medium.material_regions.len() as u32,
@@ -498,6 +531,10 @@ impl Renderer {
                     air_speed_mps: app_config.world.air_speed_mps,
                     air_density_kg_m3: app_config.world.air_density_kg_m3,
                     air_absorption_m_inv: app_config.world.air_absorption_m_inv,
+                    frequency_hz: emitter.frequency_hz,
+                    air_absorption_frequency_exponent: app_config.world.air_absorption_frequency_exponent,
+                    frequency_channel: index as u32,
+                    _frequency_padding: 0,
                     time_bin_us: app_config.simulation.energy_time_bin_us,
                     time_bin_count: app_config.simulation.energy_time_bins,
                     energy_scale,
@@ -548,7 +585,7 @@ impl Renderer {
         let material_visuals: Vec<[f32; 4]> = medium
             .material_regions
             .iter()
-            .map(|region| region.visual)
+            .flat_map(|region| [region.visual, region.visual_texture])
             .collect();
         let material_bounds = material_bounds_data;
         let material_visuals_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -598,14 +635,14 @@ impl Renderer {
                 uniform_layout_entry(3, wgpu::ShaderStages::COMPUTE),
                 storage_layout_entry(4, wgpu::ShaderStages::COMPUTE, true),
                 storage_layout_entry(5, wgpu::ShaderStages::COMPUTE, false),
+                storage_layout_entry(6, wgpu::ShaderStages::COMPUTE, false),
             ],
         });
-        let solve_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("transport_compute_pipeline_layout"),
-                bind_group_layouts: &[&solve_bgl],
-                push_constant_ranges: &[],
-            });
+        let solve_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("transport_compute_pipeline_layout"),
+            bind_group_layouts: &[&solve_bgl],
+            push_constant_ranges: &[],
+        });
         let solve_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("one_shot_packet_transport"),
             layout: Some(&solve_pipeline_layout),
@@ -620,88 +657,56 @@ impl Renderer {
                     label: Some("val_transport_compute_bind_group"),
                     layout: &solve_bgl,
                     entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&med_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Sampler(&med_smp),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: energy_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: params.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: material_bounds_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: debug_segment_buffer.as_entire_binding(),
-                        },
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&med_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&med_smp) },
+                        wgpu::BindGroupEntry { binding: 2, resource: energy_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: params.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: material_bounds_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: debug_segment_buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: listener_capture_buffer.as_entire_binding() },
                     ],
                 })
             })
             .collect();
 
-        let energy_display_bgl =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("time_filtered_energy_layout"),
-                entries: &[
-                    storage_layout_entry(0, wgpu::ShaderStages::COMPUTE, true),
-                    uniform_layout_entry(1, wgpu::ShaderStages::COMPUTE),
-                    uniform_layout_entry(2, wgpu::ShaderStages::COMPUTE),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::StorageTexture {
-                            access: wgpu::StorageTextureAccess::WriteOnly,
-                            format: wgpu::TextureFormat::R32Float,
-                            view_dimension: wgpu::TextureViewDimension::D3,
-                        },
-                        count: None,
+        let energy_display_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("time_filtered_energy_layout"),
+            entries: &[
+                storage_layout_entry(0, wgpu::ShaderStages::COMPUTE, true),
+                uniform_layout_entry(1, wgpu::ShaderStages::COMPUTE),
+                uniform_layout_entry(2, wgpu::ShaderStages::COMPUTE),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D3,
                     },
-                ],
-            });
-        let energy_display_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("time_filtered_energy_pipeline_layout"),
-                bind_group_layouts: &[&energy_display_bgl],
-                push_constant_ranges: &[],
-            });
-        let energy_display_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("time_filtered_energy_update"),
-                layout: Some(&energy_display_layout),
-                module: &energy_display_mod,
-                entry_point: "main",
-                compilation_options: Default::default(),
-            });
+                    count: None,
+                },
+            ],
+        });
+        let energy_display_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("time_filtered_energy_pipeline_layout"),
+            bind_group_layouts: &[&energy_display_bgl],
+            push_constant_ranges: &[],
+        });
+        let energy_display_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("time_filtered_energy_update"),
+            layout: Some(&energy_display_layout),
+            module: &energy_display_mod,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
         let energy_display_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("time_filtered_energy_bind_group"),
             layout: &energy_display_bgl,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: energy_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: dim_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: play_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&energy_display_view),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: energy_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: dim_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: play_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&energy_display_view) },
             ],
         });
 
@@ -719,14 +724,55 @@ impl Renderer {
             pass.set_pipeline(&solve_pipeline);
             pass.set_bind_group(0, solve_bind, &[]);
             pass.dispatch_workgroups(ray_workgroups, 1, 1);
-            eprintln!(
-                "VAL emitter {} transport dispatch queued: {} packets",
-                emitter_index + 1,
-                ray_count
-            );
+            eprintln!("VAL emitter {} transport dispatch queued: {} packets", emitter_index + 1, ray_count);
         }
         queue.submit(Some(solve_encoder.finish()));
         device.poll(wgpu::Maintain::Wait);
+
+        // Read the absorbing listener's per-emitter capture totals once after the
+        // precomputed transport solve. Values share the fixed-point energy scale
+        // used by voxel deposits, so dividing by energy_scale restores relative
+        // received power in the same units as emitter amplitude.
+        let listener_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("listener_capture_readback"),
+            size: listener_capture_bytes.max(4),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut listener_copy_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("listener_capture_readback_encoder"),
+        });
+        listener_copy_encoder.copy_buffer_to_buffer(
+            &listener_capture_buffer,
+            0,
+            &listener_readback,
+            0,
+            listener_capture_bytes.max(4),
+        );
+        queue.submit(Some(listener_copy_encoder.finish()));
+        let listener_slice = listener_readback.slice(..);
+        let (listener_map_tx, listener_map_rx) = std::sync::mpsc::channel();
+        listener_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = listener_map_tx.send(result);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        listener_map_rx.recv().expect("listener readback callback dropped")
+            .expect("listener capture readback mapping failed");
+        let listener_mapped = listener_slice.get_mapped_range();
+        let listener_fixed: Vec<u32> = bytemuck::cast_slice(&listener_mapped).to_vec();
+        drop(listener_mapped);
+        listener_readback.unmap();
+        let listener_results = app_config.emitters.iter().enumerate().map(|(index, emitter)| {
+            let received = listener_fixed.get(index).copied().unwrap_or(0) as f32 / energy_scale.max(1.0);
+            let emitted = emitter.amplitude.max(0.0);
+            EmitterListenerResult {
+                name: emitter.name.clone(),
+                frequency_hz: emitter.frequency_hz,
+                emitted_power: emitted,
+                received_power: received,
+                transmission_percent: if emitted > 0.0 { (received / emitted * 100.0).clamp(0.0, 100.0) } else { 0.0 },
+            }
+        }).collect::<Vec<_>>();
         eprintln!(
             "VAL transport solve complete: {} emitters × {ray_count} packets, {} total packets × {} max segments across air/materials ({:.2?}); world histogram {:.1} MiB",
             app_config.emitters.len(),
@@ -766,12 +812,11 @@ impl Renderer {
                 storage_layout_entry(6, wgpu::ShaderStages::FRAGMENT, true),
             ],
         });
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("volume_render_pipeline_layout"),
-                bind_group_layouts: &[&render_bgl],
-                push_constant_ranges: &[],
-            });
+        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("volume_render_pipeline_layout"),
+            bind_group_layouts: &[&render_bgl],
+            push_constant_ranges: &[],
+        });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("volume_raymarch_pipeline"),
             layout: Some(&render_pipeline_layout),
@@ -800,34 +845,13 @@ impl Renderer {
             label: Some("volume_render_bind_group"),
             layout: &render_bgl,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&energy_display_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: cam_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: dim_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: play_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&med_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: material_visuals_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: material_bounds_buf.as_entire_binding(),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&energy_display_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: cam_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: dim_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: play_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&med_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: material_visuals_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: material_bounds_buf.as_entire_binding() },
             ],
         });
 
@@ -908,14 +932,8 @@ impl Renderer {
             label: Some("transport_debug_ray_render_bind"),
             layout: &debug_ray_bgl,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: debug_segment_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: cam_buf.as_entire_binding(),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: debug_segment_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: cam_buf.as_entire_binding() },
             ],
         });
         let debug_ray_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -975,6 +993,8 @@ impl Renderer {
             _energy_display_texture: energy_display_texture,
             energy_display_workgroups,
             last_energy_time_bits: None,
+            last_energy_channel: None,
+            listener_results,
             _debug_segment_buffer: debug_segment_buffer,
             debug_segment_bind: debug_ray_bind,
             debug_ray_pipeline,
@@ -1034,23 +1054,11 @@ impl Renderer {
             label: Some("reduced_resolution_volume_target_bind"),
             layout,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
             ],
         });
-        SceneTarget {
-            _texture: texture,
-            view,
-            bind_group,
-            width,
-            height,
-        }
+        SceneTarget { _texture: texture, view, bind_group, width, height }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -1084,28 +1092,15 @@ impl Renderer {
         show_debug_rays: bool,
         viewport_rect: Option<egui::Rect>,
     ) {
-        // Render the 3D scene into the central HUD viewport only. The surface
-        // remains window-sized so egui can draw its docks over the same frame.
+        // Render the 3D scene into the central viewport only; egui still owns
+        // the full window surface and draws its docks over the composed frame.
         let scale = pixels_per_point.max(0.1);
         let (view_x, view_y, view_width, view_height) = if let Some(rect) = viewport_rect {
-            let x = (rect.min.x * scale)
-                .round()
-                .clamp(0.0, self.config.width as f32) as u32;
-            let y = (rect.min.y * scale)
-                .round()
-                .clamp(0.0, self.config.height as f32) as u32;
-            let right = (rect.max.x * scale)
-                .round()
-                .clamp(x as f32, self.config.width as f32) as u32;
-            let bottom = (rect.max.y * scale)
-                .round()
-                .clamp(y as f32, self.config.height as f32) as u32;
-            (
-                x,
-                y,
-                right.saturating_sub(x).max(1),
-                bottom.saturating_sub(y).max(1),
-            )
+            let x = (rect.min.x * scale).round().clamp(0.0, self.config.width as f32) as u32;
+            let y = (rect.min.y * scale).round().clamp(0.0, self.config.height as f32) as u32;
+            let right = (rect.max.x * scale).round().clamp(x as f32, self.config.width as f32) as u32;
+            let bottom = (rect.max.y * scale).round().clamp(y as f32, self.config.height as f32) as u32;
+            (x, y, right.saturating_sub(x).max(1), bottom.saturating_sub(y).max(1))
         } else {
             (0, 0, self.config.width.max(1), self.config.height.max(1))
         };
@@ -1124,16 +1119,10 @@ impl Renderer {
             self.scene_view_height = view_height;
         }
         let mut internal_cam = *cam;
-        internal_cam.screen = [
-            self.scene_target.width as f32,
-            self.scene_target.height as f32,
-        ];
-        internal_cam.aspect =
-            self.scene_target.width as f32 / self.scene_target.height.max(1) as f32;
-        self.queue
-            .write_buffer(&self.cam_buf, 0, bytemuck::bytes_of(&internal_cam));
-        self.queue
-            .write_buffer(&self.play_buf, 0, bytemuck::bytes_of(play));
+        internal_cam.screen = [self.scene_target.width as f32, self.scene_target.height as f32];
+        internal_cam.aspect = self.scene_target.width as f32 / self.scene_target.height.max(1) as f32;
+        self.queue.write_buffer(&self.cam_buf, 0, bytemuck::bytes_of(&internal_cam));
+        self.queue.write_buffer(&self.play_buf, 0, bytemuck::bytes_of(play));
 
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
@@ -1143,17 +1132,14 @@ impl Renderer {
             }
             Err(wgpu::SurfaceError::Timeout | wgpu::SurfaceError::OutOfMemory) => return,
         };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frame_encoder"),
-            });
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("frame_encoder"),
+        });
         // Camera-only redraws while paused reuse the last filtered 3D field.
         // The full-world compute reduction runs only when timeline time changes.
-        let update_energy_field = self.last_energy_time_bits != Some(play.t_us.to_bits());
+        let update_energy_field = self.last_energy_time_bits != Some(play.t_us.to_bits())
+            || self.last_energy_channel != Some(play.history_counts[1]);
         if update_energy_field {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("time_filtered_energy_update_pass"),
@@ -1222,20 +1208,12 @@ impl Renderer {
             });
             pass.set_pipeline(&self.blit_pipeline);
             pass.set_bind_group(0, &self.scene_target.bind_group, &[]);
-            pass.set_viewport(
-                view_x as f32,
-                view_y as f32,
-                view_width as f32,
-                view_height as f32,
-                0.0,
-                1.0,
-            );
+            pass.set_viewport(view_x as f32, view_y as f32, view_width as f32, view_height as f32, 0.0, 1.0);
             pass.set_scissor_rect(view_x, view_y, view_width, view_height);
             pass.draw(0..3, 0..1);
         }
         for (texture_id, image_delta) in &ui_textures.set {
-            self.egui_renderer
-                .update_texture(&self.device, &self.queue, *texture_id, image_delta);
+            self.egui_renderer.update_texture(&self.device, &self.queue, *texture_id, image_delta);
         }
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
@@ -1263,19 +1241,19 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            self.egui_renderer
-                .render(&mut pass, ui_primitives, &screen_descriptor);
+            self.egui_renderer.render(
+                &mut pass,
+                ui_primitives,
+                &screen_descriptor,
+            );
         }
-        self.queue.submit(
-            callback_commands
-                .into_iter()
-                .chain(std::iter::once(encoder.finish())),
-        );
+        self.queue.submit(callback_commands.into_iter().chain(std::iter::once(encoder.finish())));
         for texture_id in &ui_textures.free {
             self.egui_renderer.free_texture(texture_id);
         }
         if update_energy_field {
             self.last_energy_time_bits = Some(play.t_us.to_bits());
+            self.last_energy_channel = Some(play.history_counts[1]);
         }
         frame.present();
     }
@@ -1301,15 +1279,13 @@ fn create_zeroed_storage_buffer(
     label: &str,
 ) -> Result<wgpu::Buffer, String> {
     if size == 0 {
-        return Err(format!(
-            "VAL requested a zero-byte storage buffer for '{label}'"
-        ));
+        return Err(format!("VAL requested a zero-byte storage buffer for '{label}'"));
     }
     device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: true,
     });
     device.poll(wgpu::Maintain::Wait);
@@ -1344,10 +1320,7 @@ fn storage_layout_entry(
     }
 }
 
-fn uniform_layout_entry(
-    binding: u32,
-    visibility: wgpu::ShaderStages,
-) -> wgpu::BindGroupLayoutEntry {
+fn uniform_layout_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
@@ -1368,21 +1341,15 @@ fn pack_medium_texture(medium: &VoxelMedium) -> Result<Vec<u8>, String> {
     let width = medium.dim[0] as usize;
     let height = medium.dim[1] as usize;
     let depth = medium.dim[2] as usize;
-    let row_bytes = width
-        .checked_mul(8)
-        .ok_or_else(|| "medium row byte count overflow".to_string())?;
+    let row_bytes = width.checked_mul(8).ok_or_else(|| "medium row byte count overflow".to_string())?;
     let padded_row_bytes = align_to(row_bytes as u32, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) as usize;
     let byte_len = padded_row_bytes
         .checked_mul(height)
         .and_then(|v| v.checked_mul(depth))
         .ok_or_else(|| "medium texture upload size overflow".to_string())?;
     let mut bytes = Vec::new();
-    bytes.try_reserve_exact(byte_len).map_err(|error| {
-        format!(
-            "unable to reserve {:.1} MiB for medium upload: {error}",
-            byte_len as f64 / 1_048_576.0
-        )
-    })?;
+    bytes.try_reserve_exact(byte_len)
+        .map_err(|error| format!("unable to reserve {:.1} MiB for medium upload: {error}", byte_len as f64 / 1_048_576.0))?;
     bytes.resize(byte_len, 0u8);
 
     for z in 0..depth {
@@ -1414,6 +1381,7 @@ mod uniform_layout_tests {
     }
 }
 
+
 #[cfg(test)]
 mod debug_layout_tests {
     use super::{DebugRaySegment, SolveParams};
@@ -1421,6 +1389,6 @@ mod debug_layout_tests {
     #[test]
     fn debug_ray_gpu_struct_layouts_match_wgsl_vec4_strides() {
         assert_eq!(std::mem::size_of::<DebugRaySegment>(), 48);
-        assert_eq!(std::mem::size_of::<SolveParams>(), 128);
+        assert_eq!(std::mem::size_of::<SolveParams>(), 176);
     }
 }

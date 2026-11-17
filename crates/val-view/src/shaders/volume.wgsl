@@ -26,6 +26,7 @@ struct MaterialBounds {
     min: vec4<u32>,
     max: vec4<u32>,
     properties: vec4<f32>, // effective density, mean absorption, mean scattering, mean sound speed
+    spectral: vec4<f32>,
 };
 
 @group(0) @binding(0) var live_energy_tex: texture_3d<f32>;
@@ -220,7 +221,8 @@ fn fs(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
         t_max = select(vec3<f32>(1.0e30), t_max, abs(ray_dir) > vec3<f32>(0.0000001));
         let extent = bounds.max.xyz - bounds.min.xyz;
         let step_limit = extent.x + extent.y + extent.z + 4u;
-        let material_visual = material_visuals[nearest_index];
+        let material_visual = material_visuals[nearest_index * 2u];
+        let texture_settings = material_visuals[nearest_index * 2u + 1u];
         var local_transmittance = scene_transmittance;
 
         for (var step = 0u; step < step_limit; step = step + 1u) {
@@ -233,10 +235,30 @@ fn fs(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
                 ^ (u32(vi.z) * 26699u)
                 ^ (nearest_index * 31847u);
             let hash_mix = cell_hash ^ (cell_hash >> 16u);
-            let fiber = 0.86 + 0.14 * (f32(hash_mix & 255u) / 255.0);
+            let hash_noise = f32(hash_mix & 65535u) / 65535.0;
+            let texture_scale = max(texture_settings.y, 0.00005);
+            let angle = texture_settings.w;
+            let fibre_axis = vec2<f32>(cos(angle), sin(angle));
+            let cross_axis = vec2<f32>(-fibre_axis.y, fibre_axis.x);
+            let world_xy = vec2<f32>(vi.xy) * voxel_size;
+            let along = dot(world_xy, fibre_axis) / texture_scale;
+            let across = dot(world_xy, cross_axis) / texture_scale;
+            let fibre_ridge = 0.5 + 0.5 * sin(along * 6.2831853 + hash_noise * 3.0);
+            let cross_lattice = 0.5 + 0.5 * sin(across * 6.2831853);
+            var pattern = 0.58 * hash_noise + 0.42 * fibre_ridge;
+            let pattern_id = u32(round(texture_settings.x));
+            if (pattern_id == 1u) {
+                pattern = 0.55 * fibre_ridge + 0.45 * cross_lattice;
+            } else if (pattern_id == 2u) {
+                pattern = 0.5;
+            } else if (pattern_id == 3u) {
+                pattern = hash_noise;
+            }
+            let texture_contrast = clamp(texture_settings.z, 0.0, 1.0);
+            let fibre = mix(1.0, 0.58 + pattern * 0.84, texture_contrast);
             let density_variation = clamp(med.y / 85.0, 0.0, 1.4);
             let base_alpha = clamp(
-                material_visual.a * play.visual.z * fiber,
+                material_visual.a * play.visual.z * fibre,
                 0.0,
                 0.16
             );

@@ -5,9 +5,9 @@ pub use laws::*;
 
 fn try_filled_vec<T: Clone>(len: usize, value: T, label: &str) -> Result<Vec<T>, String> {
     let mut values = Vec::new();
-    values
-        .try_reserve_exact(len)
-        .map_err(|error| format!("unable to allocate {len} elements for {label}: {error}"))?;
+    values.try_reserve_exact(len).map_err(|error| {
+        format!("unable to allocate {len} elements for {label}: {error}")
+    })?;
     values.resize(len, value);
     Ok(values)
 }
@@ -17,8 +17,7 @@ fn checked_voxel_count(dim: [u32; 3], label: &str) -> Result<usize, String> {
         .checked_mul(dim[1] as u64)
         .and_then(|v| v.checked_mul(dim[2] as u64))
         .ok_or_else(|| format!("{label} voxel count overflows u64"))?;
-    usize::try_from(count)
-        .map_err(|_| format!("{label} voxel count does not fit host address space"))
+    usize::try_from(count).map_err(|_| format!("{label} voxel count does not fit host address space"))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +48,10 @@ pub struct MaterialRegion {
     pub max: [u32; 3],
     /// RGB in linear space and per-voxel base opacity in alpha.
     pub visual: [f32; 4],
+    /// x=pattern id, y=scale in metres, z=contrast, w=fibre angle in radians.
+    pub visual_texture: [f32; 4],
+    pub absorption_frequency_exponent: f32,
+    pub scattering_frequency_exponent: f32,
     /// Bulk material density (kg/m^3), retained as physical metadata.
     pub density_kg_m3: f32,
     /// Effective dynamic density used for the approximate acoustic impedance.
@@ -81,6 +84,9 @@ pub struct FeltVolume {
     pub origin: [u32; 3],
     pub medium: VoxelMedium,
     pub visual: [f32; 4],
+    pub visual_texture: [f32; 4],
+    pub absorption_frequency_exponent: f32,
+    pub scattering_frequency_exponent: f32,
     pub density_kg_m3: f32,
     pub effective_density_kg_m3: f32,
     pub porosity: f32,
@@ -162,24 +168,18 @@ pub fn compose_world(
     let mut c = try_filled_vec(count, air_speed, "world sound-speed field")?;
     let mut occupied = try_filled_vec(count, false, "world material occupancy field")?;
     let mut material_regions = Vec::new();
-    material_regions
-        .try_reserve_exact(volumes.len())
+    material_regions.try_reserve_exact(volumes.len())
         .map_err(|error| format!("unable to reserve material-region metadata: {error}"))?;
 
     for (volume_index, volume) in volumes.into_iter().enumerate() {
         if (volume.medium.spacing - spacing).abs() > 1e-7 {
-            return Err(format!(
-                "material {} uses a different voxel spacing",
-                volume.name
-            ));
+            return Err(format!("material {} uses a different voxel spacing", volume.name));
         }
         let mut max = [0u32; 3];
         for axis in 0..3 {
             max[axis] = volume.origin[axis]
                 .checked_add(volume.medium.dim[axis])
-                .ok_or_else(|| {
-                    format!("material {} bound overflows voxel coordinates", volume.name)
-                })?;
+                .ok_or_else(|| format!("material {} bound overflows voxel coordinates", volume.name))?;
             if max[axis] > world_dim[axis] {
                 return Err(format!("material {} exceeds world bounds on {}: end {} voxels, world {} voxels; move or shrink the material", volume.name, ["X", "Y", "Z"][axis], max[axis], world_dim[axis]));
             }
@@ -200,10 +200,7 @@ pub fn compose_world(
                     let src_i = z * local_y * local_x + y * local_x + x;
                     let dst_i = dst_z * world_y * world_x + dst_y * world_x + dst_x;
                     if occupied[dst_i] {
-                        return Err(format!(
-                            "material {} overlaps another felt region",
-                            volume.name
-                        ));
+                        return Err(format!("material {} overlaps another felt region", volume.name));
                     }
                     occupied[dst_i] = true;
                     sigma_a[dst_i] = volume.medium.sigma_a[src_i];
@@ -224,6 +221,9 @@ pub fn compose_world(
             min: volume.origin,
             max,
             visual: volume.visual,
+            visual_texture: volume.visual_texture,
+            absorption_frequency_exponent: volume.absorption_frequency_exponent,
+            scattering_frequency_exponent: volume.scattering_frequency_exponent,
             density_kg_m3: volume.density_kg_m3,
             effective_density_kg_m3: volume.effective_density_kg_m3,
             porosity: volume.porosity,
@@ -254,6 +254,9 @@ mod tests {
             origin,
             medium: generate_medium([2, 2, 2], 0.001, seed, &[]).unwrap(),
             visual: [0.9, 0.3, 0.1, 0.03],
+            visual_texture: [0.0, 0.0009, 0.7, 0.0],
+            absorption_frequency_exponent: 0.5,
+            scattering_frequency_exponent: 0.7,
             density_kg_m3: 180.0,
             effective_density_kg_m3: 1.8,
             porosity: 0.82,
@@ -267,8 +270,7 @@ mod tests {
             0.001,
             343.0,
             vec![volume("left", [1, 1, 1], 7), volume("right", [5, 1, 1], 9)],
-        )
-        .unwrap();
+        ).unwrap();
         assert_eq!(world.material_regions.len(), 2);
         assert_eq!(world.material_regions[1].id, 2);
         assert_eq!(world.c[0], 343.0);

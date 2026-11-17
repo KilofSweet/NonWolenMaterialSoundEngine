@@ -1,3 +1,6 @@
+mod audio;
+mod spectral;
+mod audio_workbench;
 mod camera;
 mod renderer;
 mod shaders;
@@ -6,6 +9,7 @@ mod ui;
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use winit::event::{ElementState, Event, MouseButton, WindowEvent};
@@ -13,11 +17,14 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::WindowBuilder;
 
+use val_core::audio::{write_wav_mono, AudioClip};
 use val_core::config::{AppConfig, MaterialConfig, RenderConfig};
+use crate::spectral::{export_listener_csv, process_audio_for_listener, ListenerModel, WorldAirModel};
 use val_felt::{ClumpNoise, FeltVolume, GradientDensity, MediumLaw, MediumProperties};
 
 use camera::OrbitCamera;
 use renderer::{CamUniform, PlayUniform, Renderer};
+use audio_workbench::AudioWorkbench;
 use state::PlaybackState;
 use ui::{UiAction, UiState};
 
@@ -82,6 +89,14 @@ fn build_medium(config: &AppConfig, world_dims: [u32; 3]) -> Result<val_felt::Vo
                 material.visual_color[2],
                 material.visual_opacity,
             ],
+            visual_texture: [
+                material.texture_pattern as f32,
+                material.texture_scale_mm * 0.001,
+                material.texture_strength,
+                material.texture_direction_degrees.to_radians(),
+            ],
+            absorption_frequency_exponent: material.absorption_frequency_exponent,
+            scattering_frequency_exponent: material.scattering_frequency_exponent,
             density_kg_m3: material.density_kg_m3,
             effective_density_kg_m3: material.effective_density_kg_m3,
             porosity: material.porosity,
@@ -115,6 +130,7 @@ fn report_startup_allocation(config: &AppConfig, world_dims: [u32; 3]) -> Result
         })?;
     let history_bytes = world_cells
         .checked_mul(config.simulation.energy_time_bins as u64)
+        .and_then(|v| v.checked_mul(config.emitters.len() as u64))
         .and_then(|v| v.checked_mul(std::mem::size_of::<u32>() as u64))
         .ok_or_else(|| {
             "energy-history size overflow; reduce dimensions/bins or increase voxel size"
@@ -261,6 +277,8 @@ fn main() {
     let mut playback = PlaybackState::new(&config.emitters[0]);
     let mut draft = config.clone();
     let mut ui_state = UiState::default();
+    let mut audio_workbench = AudioWorkbench::default();
+    audio_workbench.ensure_default_paths();
     let mut status = String::from("Ready · edit parameters, then Apply & rebuild");
     let mut egui_context = egui::Context::default();
     let mut egui_state = egui_winit::State::new(
@@ -436,6 +454,9 @@ fn main() {
                     let raw_input = egui_state.take_egui_input(&window);
                     let mut ui_action = UiAction::None;
                     let mut egui_context_reset = false;
+                    let packet_listener_results = renderer.as_ref()
+                        .map(|active| active.listener_results.clone())
+                        .unwrap_or_default();
                     let full_output = egui_context.run(raw_input, |ctx| {
                         ui_action = ui::draw(
                             ctx,
@@ -444,9 +465,82 @@ fn main() {
                             &mut ui_state,
                             &status,
                             &preview_camera,
+                            &mut audio_workbench,
+                            &packet_listener_results,
                         );
                     });
                     egui_state.handle_platform_output(&window, full_output.platform_output);
+
+                    if ui_state.audio_load_requested {
+                        ui_state.audio_load_requested = false;
+                        let source_path = ui_state.audio_path.trim().to_owned();
+                        match crate::audio::load(Path::new(&source_path)) {
+                            Ok(source) => {
+                                ui_state.audio_summary = format!(
+                                    "{} · {:.2}s · {} Hz · {} ch · peak {:.0} Hz · RMS {:.3}",
+                                    source.path, source.duration_seconds, source.sample_rate,
+                                    source.channels, source.peak_frequency_hz, source.rms
+                                );
+                                ui_state.audio_waveform = source.waveform.clone();
+                                ui_state.audio_spectrum = source.spectrum_bands.clone();
+                                audio_workbench.input_path = source.path.clone();
+                                audio_workbench.clip = Some(AudioClip {
+                                    samples: source.mono_samples.clone(),
+                                    sample_rate_hz: source.sample_rate,
+                                    source_channels: source.channels,
+                                });
+                                audio_workbench.capture = None;
+                                audio_workbench.status = format!(
+                                    "Loaded decoded audio · {:.2} s · {} Hz · {} channel(s) mixed to mono",
+                                    source.duration_seconds, source.sample_rate, source.channels
+                                );
+                                ui_state.audio_source = Some(source);
+                                status = "Audio source decoded; waveform, spectral metadata and listener processing are ready.".into();
+                            }
+                            Err(error) => {
+                                ui_state.audio_summary = format!("Load failed: {error}");
+                                ui_state.audio_source = None;
+                                audio_workbench.clip = None;
+                                audio_workbench.capture = None;
+                                audio_workbench.status = format!("Audio import failed: {error}");
+                                ui_state.audio_waveform.clear();
+                                ui_state.audio_spectrum.clear();
+                                status = format!("Audio import failed: {error}");
+                            }
+                        }
+                        window.request_redraw();
+                    }
+
+                    if ui_state.audio_build_emitters_requested {
+                        ui_state.audio_build_emitters_requested = false;
+                        if let Some(source) = ui_state.audio_source.as_ref() {
+                            let template = draft.emitters.first().cloned()
+                                .unwrap_or_else(val_core::config::EmitterConfig::default);
+                            let max_amp = source.spectrum_bands.iter()
+                                .map(|(_, amplitude)| *amplitude).fold(0.0f32, f32::max).max(1.0e-6);
+                            let mut spectral_emitters = Vec::new();
+                            for (frequency, amplitude) in &source.spectrum_bands {
+                                if *amplitude < 0.035 { continue; }
+                                let mut emitter = template.clone();
+                                emitter.name = format!("audio-{:.0}Hz", frequency);
+                                emitter.frequency_hz = *frequency;
+                                emitter.amplitude = (*amplitude / max_amp).max(0.01);
+                                spectral_emitters.push(emitter);
+                            }
+                            if !spectral_emitters.is_empty() {
+                                draft.emitters = spectral_emitters;
+                                ui_state.selected_emitter = 0;
+                                playback.frequency_hz = draft.emitters[0].frequency_hz;
+                                status = format!(
+                                    "Built {} frequency-band emitters from audio spectrum. Press Apply & rebuild to run transport.",
+                                    draft.emitters.len()
+                                );
+                            } else {
+                                status = "No usable spectral energy found in the audio source.".into();
+                            }
+                        }
+                        window.request_redraw();
+                    }
 
                     match ui_action {
                         UiAction::None => {}
@@ -466,6 +560,99 @@ fn main() {
                                 window.request_redraw();
                             }
                         },
+                        UiAction::ProcessAudio => {
+                            let result = (|| -> Result<_, String> {
+                                let clip = audio_workbench.clip.as_ref()
+                                    .ok_or_else(|| "load an MP3 or WAV source before processing".to_string())?;
+                                let dims = draft.validate()?;
+                                let selected = ui_state.selected_emitter.min(draft.emitters.len() - 1);
+                                // Build a temporary CPU medium for this offline FFT pass. The
+                                // persistent GPU renderer still owns its own copy; we drop this
+                                // temporary field immediately after processing to limit memory.
+                                let medium = build_medium(&draft, dims)?;
+                                let listener = ListenerModel {
+                                    position_mm: draft.listener.position_mm,
+                                    normal: draft.listener.normal,
+                                    aperture_radius_mm: draft.listener.radius_mm,
+                                };
+                                let air = WorldAirModel {
+                                    sound_speed_mps: draft.world.air_speed_mps,
+                                    density_kg_m3: draft.world.air_density_kg_m3,
+                                    absorption_m_inv: draft.world.air_absorption_m_inv,
+                                    absorption_frequency_exponent: draft.world.air_absorption_frequency_exponent,
+                                };
+                                process_audio_for_listener(
+                                    clip,
+                                    draft.emitters[selected].position_mm,
+                                    listener,
+                                    &medium,
+                                    air,
+                                )
+                            })();
+                            match result {
+                                Ok(capture) => {
+                                    audio_workbench.status = format!(
+                                        "Listener processed recording · {:.3} ms travel time · {:.2}% input power received",
+                                        capture.travel_time_seconds * 1000.0,
+                                        if capture.total_input_power > 0.0 {
+                                            capture.total_received_power / capture.total_input_power * 100.0
+                                        } else { 0.0 }
+                                    );
+                                    audio_workbench.capture = Some(capture);
+                                }
+                                Err(error) => audio_workbench.status = format!("Audio processing failed: {error}"),
+                            }
+                            window.request_redraw();
+                        }
+                        UiAction::ExportListenerCsv => {
+                            let result = audio_workbench.capture.as_ref()
+                                .ok_or_else(|| "there is no listener spectrum to export".to_string())
+                                .and_then(|capture| export_listener_csv(&audio_workbench.output_csv_path, capture));
+                            audio_workbench.status = match result {
+                                Ok(()) => format!("Exported listener spectrum to {}", audio_workbench.output_csv_path),
+                                Err(error) => format!("CSV export failed: {error}"),
+                            };
+                            window.request_redraw();
+                        }
+                        UiAction::ExportListenerWav => {
+                            let result = audio_workbench.capture.as_ref()
+                                .ok_or_else(|| "there is no reconstructed listener audio to export".to_string())
+                                .and_then(|capture| write_wav_mono(
+                                    &audio_workbench.output_wav_path,
+                                    &capture.samples,
+                                    capture.sample_rate_hz,
+                                ));
+                            audio_workbench.status = match result {
+                                Ok(()) => format!("Exported reconstructed audio to {}", audio_workbench.output_wav_path),
+                                Err(error) => format!("WAV export failed: {error}"),
+                            };
+                            window.request_redraw();
+                        }
+                        UiAction::ExportPacketListenerCsv => {
+                            let result = (|| -> Result<(), String> {
+                                let mut csv = String::from("emitter,frequency_hz,emitted_power,received_power,lost_power,transmission_percent\n");
+                                for item in renderer.as_ref().ok_or_else(|| "renderer is unavailable".to_string())?.listener_results.iter() {
+                                    use std::fmt::Write as _;
+                                    writeln!(
+                                        &mut csv,
+                                        "\"{}\",{:.3},{:.9},{:.9},{:.9},{:.6}",
+                                        item.name.replace('\"', "\"\""),
+                                        item.frequency_hz,
+                                        item.emitted_power,
+                                        item.received_power,
+                                        (item.emitted_power - item.received_power).max(0.0),
+                                        item.transmission_percent,
+                                    ).map_err(|error| format!("unable to format packet listener CSV: {error}"))?;
+                                }
+                                std::fs::write(&audio_workbench.output_packet_csv_path, csv)
+                                    .map_err(|error| format!("unable to write packet listener CSV: {error}"))
+                            })();
+                            audio_workbench.status = match result {
+                                Ok(()) => format!("Exported packet listener capture to {}", audio_workbench.output_packet_csv_path),
+                                Err(error) => format!("Packet listener CSV export failed: {error}"),
+                            };
+                            window.request_redraw();
+                        }
                         UiAction::Apply => match draft.validate() {
                             Err(error) => {
                                 status = format!("Apply rejected: {error}");
@@ -507,6 +694,8 @@ fn main() {
                                     );
                                     egui_context_reset = true;
                                     config = draft.clone();
+                                    audio_workbench.capture = None;
+                                    audio_workbench.status = "Configuration applied; process the loaded recording again to update its listener capture".into();
                                     held.clear();
                                     orbit_dragging = false;
                                     camera = OrbitCamera::from_config(&config.camera);

@@ -12,7 +12,7 @@ struct Play {
     emission: vec4<f32>,
     history: vec4<f32>, // x=bin width us, z=inverse fixed-point scale, w=max felt alpha
     visual2: vec4<f32>, // xyz=energy hot color (linear RGB), w=max air-wave alpha
-    history_counts: vec4<u32>, // x=exact number of time bins
+    history_counts: vec4<u32>, // x=time bins, y=selected emitter/frequency channel
 };
 
 @group(0) @binding(0) var<storage, read> energy_hist: array<u32>;
@@ -26,6 +26,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (any(gid >= dims)) { return; }
 
     let cell_index = gid.x + gid.y * dims.x + gid.z * dims.x * dims.y;
+    let world_cells = dims.x * dims.y * dims.z;
+    let channel_offset = play.history_counts.y * world_cells * play.history_counts.x;
     let bin_width = max(play.history.x, 0.001);
     let bin_count = play.history_counts.x;
     let now_us = max(play.t_us, 0.0);
@@ -40,7 +42,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (age_bin <= current_bin) {
             let bin = current_bin - age_bin;
             if (bin < bin_count) {
-                let raw = energy_hist[cell_index * bin_count + bin];
+                let raw = energy_hist[channel_offset + cell_index * bin_count + bin];
                 let bin_start = f32(bin) * bin_width;
                 let bin_end = bin_start + bin_width;
                 // Deposits inside a temporal bin are treated as uniformly

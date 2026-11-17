@@ -6,6 +6,7 @@ use std::{collections::HashSet, fs, path::Path};
 pub struct AppConfig {
     pub world: WorldConfig,
     pub emitters: Vec<EmitterConfig>,
+    pub listener: ListenerConfig,
     pub simulation: SimulationConfig,
     pub render: RenderConfig,
     pub camera: CameraConfig,
@@ -18,6 +19,7 @@ impl Default for AppConfig {
         Self {
             world: WorldConfig::default(),
             emitters: vec![EmitterConfig::default()],
+            listener: ListenerConfig::default(),
             simulation: SimulationConfig::default(),
             render: RenderConfig::default(),
             camera: CameraConfig::default(),
@@ -37,6 +39,8 @@ pub struct WorldConfig {
     pub air_density_kg_m3: f32,
     /// Energy attenuation coefficient in air (m^-1).
     pub air_absorption_m_inv: f32,
+    /// Power-law exponent relative to the 1 kHz reference frequency.
+    pub air_absorption_frequency_exponent: f32,
     pub seed: u64,
 }
 
@@ -48,6 +52,7 @@ impl Default for WorldConfig {
             air_speed_mps: 343.0,
             air_density_kg_m3: 1.204,
             air_absorption_m_inv: 0.0,
+            air_absorption_frequency_exponent: 0.5,
             seed: 7,
         }
     }
@@ -78,6 +83,27 @@ impl Default for EmitterConfig {
             amplitude: 1.0,
             direction: [1.0, 0.0, 0.0],
             cone_half_angle_degrees: 25.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ListenerConfig {
+    /// Center of the absorbing measurement aperture in world millimetres.
+    pub position_mm: [f32; 3],
+    /// Listener normal points back toward the incoming source.
+    pub normal: [f32; 3],
+    /// Circular aperture radius in millimetres.
+    pub radius_mm: f32,
+}
+
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self {
+            position_mm: [120.0, 48.0, 48.0],
+            normal: [-1.0, 0.0, 0.0],
+            radius_mm: 12.0,
         }
     }
 }
@@ -132,6 +158,7 @@ impl Default for RenderConfig {
         }
     }
 }
+
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -211,8 +238,20 @@ pub struct MaterialConfig {
     /// This is not the bulk density; porous media can have a much lower dynamic density.
     pub effective_density_kg_m3: f32,
     pub porosity: f32,
+    /// Frequency response exponents referenced to 1 kHz. These are tunable
+    /// approximations; replace them with measured material response curves.
+    pub absorption_frequency_exponent: f32,
+    pub scattering_frequency_exponent: f32,
     pub visual_color: [f32; 3],
     pub visual_opacity: f32,
+    /// Procedural non-woven appearance: 0=felt, 1=woven, 2=smooth, 3=random fibre.
+    pub texture_pattern: u32,
+    /// Apparent fibre scale in millimetres.
+    pub texture_scale_mm: f32,
+    /// Texture contrast in [0, 1].
+    pub texture_strength: f32,
+    /// Fibre orientation in the XY plane, in degrees.
+    pub texture_direction_degrees: f32,
     pub seed: Option<u64>,
     pub gradient_axis: usize,
     pub gradient_strength: f32,
@@ -225,7 +264,7 @@ impl Default for MaterialConfig {
         Self {
             name: "warm-felt".into(),
             bounds_min_mm: [64.0, 16.0, 16.0],
-            bounds_max_mm: [128.0, 80.0, 80.0],
+            bounds_max_mm: [112.0, 80.0, 80.0],
             // Demonstration preset: deliberately absorptive; replace with measured data.
             sigma_a_m_inv: 60.0,
             sigma_s_m_inv: 8.0,
@@ -234,8 +273,14 @@ impl Default for MaterialConfig {
             density_kg_m3: 180.0,
             effective_density_kg_m3: 1.8,
             porosity: 0.82,
+            absorption_frequency_exponent: 0.5,
+            scattering_frequency_exponent: 0.7,
             visual_color: [0.95, 0.43, 0.12],
             visual_opacity: 0.012,
+            texture_pattern: 0,
+            texture_scale_mm: 0.9,
+            texture_strength: 0.72,
+            texture_direction_degrees: 0.0,
             seed: None,
             gradient_axis: 1,
             gradient_strength: 0.5,
@@ -289,10 +334,10 @@ impl AppConfig {
             || !self.world.air_absorption_m_inv.is_finite()
             || self.world.air_absorption_m_inv < 0.0
             || self.world.air_absorption_m_inv > 100.0
+            || !self.world.air_absorption_frequency_exponent.is_finite()
+            || !(-2.0..=4.0).contains(&self.world.air_absorption_frequency_exponent)
         {
-            return Err(
-                "air density or absorption coefficient is outside the supported range".into(),
-            );
+            return Err("air density or absorption coefficient is outside the supported range".into());
         }
 
         let mut dims = [0u32; 3];
@@ -308,9 +353,7 @@ impl AppConfig {
             // Device texture/storage limits and fallible host/GPU allocations are
             // checked against the actual selected hardware during setup.
             if rounded >= 4_294_967_296.0 {
-                return Err(format!(
-                    "world dimension on axis {axis} exceeds the u32 voxel-coordinate range"
-                ));
+                return Err(format!("world dimension on axis {axis} exceeds the u32 voxel-coordinate range"));
             }
             dims[axis] = rounded as u32;
         }
@@ -318,10 +361,7 @@ impl AppConfig {
         let voxel_count = (dims[0] as u64)
             .checked_mul(dims[1] as u64)
             .and_then(|v| v.checked_mul(dims[2] as u64))
-            .ok_or_else(|| {
-                "world voxel count overflows u64; reduce dimensions or increase voxel_size_mm"
-                    .to_string()
-            })?;
+            .ok_or_else(|| "world voxel count overflows u64; reduce dimensions or increase voxel_size_mm".to_string())?;
 
         if self.emitters.is_empty() {
             return Err("configure at least one [[emitters]] sound source".into());
@@ -336,15 +376,10 @@ impl AppConfig {
                 return Err("every emitter must have a non-empty name".into());
             }
             if !emitter_names.insert(name.to_lowercase()) {
-                return Err(format!(
-                    "emitter name '{}' is duplicated; give each emitter a unique name",
-                    emitter.name
-                ));
+                return Err(format!("emitter name '{}' is duplicated; give each emitter a unique name", emitter.name));
             }
         }
-        let total_emitter_amplitude = self
-            .emitters
-            .iter()
+        let total_emitter_amplitude = self.emitters.iter()
             .map(|emitter| emitter.amplitude as f64)
             .sum::<f64>();
         if !total_emitter_amplitude.is_finite() || total_emitter_amplitude <= 0.0 {
@@ -357,10 +392,7 @@ impl AppConfig {
                 return Err("every felt material region must have a non-empty name".into());
             }
             if !material_names.insert(name.to_lowercase()) {
-                return Err(format!(
-                    "material name '{}' is duplicated; give each region a unique name",
-                    material.name
-                ));
+                return Err(format!("material name '{}' is duplicated; give each region a unique name", material.name));
             }
         }
         let mut bounds: Vec<([u32; 3], [u32; 3])> = Vec::with_capacity(self.materials.len());
@@ -380,11 +412,7 @@ impl AppConfig {
                     let world_mm = self.world.dimensions_mm[axis];
                     let size_mm = material.bounds_max_mm[axis] - material.bounds_min_mm[axis];
                     if size_mm <= world_mm {
-                        let delta = if a < 0.0 {
-                            -material.bounds_min_mm[axis]
-                        } else {
-                            world_mm - material.bounds_max_mm[axis]
-                        };
+                        let delta = if a < 0.0 { -material.bounds_min_mm[axis] } else { world_mm - material.bounds_max_mm[axis] };
                         let direction = if delta < 0.0 { "-" } else { "+" };
                         return Err(format!(
                             "material '{}' is outside the world on {} (bounds {:.2}..{:.2} mm, world 0..{:.2} mm). Suggested fix: move this material {:.2} mm along {}{}; new bounds {:.2}..{:.2} mm.",
@@ -436,7 +464,12 @@ impl AppConfig {
                 || !material.sound_speed_mps.is_finite()
                 || !material.density_kg_m3.is_finite()
                 || !material.porosity.is_finite()
+                || !material.absorption_frequency_exponent.is_finite()
+                || !material.scattering_frequency_exponent.is_finite()
                 || !material.visual_opacity.is_finite()
+                || !material.texture_scale_mm.is_finite()
+                || !material.texture_strength.is_finite()
+                || !material.texture_direction_degrees.is_finite()
                 || material.sigma_a_m_inv < 0.0
                 || material.sigma_s_m_inv < 0.0
                 || material.sigma_a_m_inv > 10_000.0
@@ -448,10 +481,13 @@ impl AppConfig {
                 || !material.effective_density_kg_m3.is_finite()
                 || !(0.1..=100.0).contains(&material.effective_density_kg_m3)
                 || !(0.0..=1.0).contains(&material.visual_opacity)
-                || material
-                    .visual_color
-                    .iter()
-                    .any(|v| !v.is_finite() || *v < 0.0 || *v > 1.0)
+                || !(-2.0..=4.0).contains(&material.absorption_frequency_exponent)
+                || !(-2.0..=4.0).contains(&material.scattering_frequency_exponent)
+                || !(0..=3).contains(&material.texture_pattern)
+                || !(0.05..=50.0).contains(&material.texture_scale_mm)
+                || !(0.0..=1.0).contains(&material.texture_strength)
+                || !(-360.0..=360.0).contains(&material.texture_direction_degrees)
+                || material.visual_color.iter().any(|v| !v.is_finite() || *v < 0.0 || *v > 1.0)
                 || material.clump_strength < 0.0
                 || material.clump_strength > 1.0
                 || !material.clump_strength.is_finite()
@@ -461,20 +497,13 @@ impl AppConfig {
                 || material.gradient_strength > 5.0
                 || !material.gradient_strength.is_finite()
             {
-                return Err(format!(
-                    "material {} has invalid physical or visual properties",
-                    material.name
-                ));
+                return Err(format!("material {} has invalid physical or visual properties", material.name));
             }
             if material.gradient_axis > 2 {
-                return Err(format!(
-                    "material {} gradient_axis must be 0, 1, or 2",
-                    material.name
-                ));
+                return Err(format!("material {} gradient_axis must be 0, 1, or 2", material.name));
             }
             for (other_index, (other_min, other_max)) in bounds.iter().enumerate() {
-                let overlaps =
-                    (0..3).all(|axis| min[axis] < other_max[axis] && max[axis] > other_min[axis]);
+                let overlaps = (0..3).all(|axis| min[axis] < other_max[axis] && max[axis] > other_min[axis]);
                 if overlaps {
                     let other = &self.materials[other_index];
                     let mut moves: Vec<(f32, usize, f32)> = Vec::new();
@@ -513,21 +542,68 @@ impl AppConfig {
             bounds.push((min, max));
         }
 
+        if self.listener.position_mm.iter().any(|v| !v.is_finite())
+            || !self.listener.radius_mm.is_finite()
+            || self.listener.radius_mm <= 0.0
+            || self.listener.normal.iter().any(|v| !v.is_finite())
+        {
+            return Err("listener position, aperture radius and normal must be finite; radius must be positive".into());
+        }
+        let listener_normal_len = self.listener.normal.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if listener_normal_len < 1e-5 {
+            return Err("listener.normal must be a non-zero direction".into());
+        }
+        for axis in 0..3 {
+            if self.listener.position_mm[axis] < 0.0
+                || self.listener.position_mm[axis] >= self.world.dimensions_mm[axis]
+            {
+                return Err(format!(
+                    "listener is outside the world on {}: {:.2} mm is not inside 0..{:.2} mm",
+                    axis_name(axis), self.listener.position_mm[axis], self.world.dimensions_mm[axis]
+                ));
+            }
+        }
+        if self.materials.iter().any(|material| {
+            (0..3).all(|axis| self.listener.position_mm[axis] >= material.bounds_min_mm[axis]
+                && self.listener.position_mm[axis] < material.bounds_max_mm[axis])
+        }) {
+            return Err("listener must be placed in air after the test volume, not inside a material region".into());
+        }
+
+        for emitter in &self.emitters {
+            let toward_listener = [
+                self.listener.position_mm[0] - emitter.position_mm[0],
+                self.listener.position_mm[1] - emitter.position_mm[1],
+                self.listener.position_mm[2] - emitter.position_mm[2],
+            ];
+            let path_len = toward_listener.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if path_len <= 1e-5 {
+                return Err(format!("listener and emitter '{}' must occupy different positions", emitter.name));
+            }
+            let facing = (0..3).map(|axis| {
+                toward_listener[axis] / path_len * self.listener.normal[axis] / listener_normal_len
+            }).sum::<f32>();
+            if facing > -0.05 {
+                return Err(format!(
+                    "listener face normal does not point toward emitter '{}'. Reverse listener.normal or reposition the listener behind the test volume.",
+                    emitter.name
+                ));
+            }
+        }
+
         if self.simulation.energy_time_bins == 0
             || !self.simulation.energy_time_bin_us.is_finite()
             || self.simulation.energy_time_bin_us <= 0.0
         {
-            return Err(
-                "simulation.energy_time_bins and energy_time_bin_us must be greater than zero"
-                    .into(),
-            );
+            return Err("simulation.energy_time_bins and energy_time_bin_us must be greater than zero".into());
         }
         // Checked arithmetic only: no prototype memory budget. The actual
         // histogram size is compared with the adapter's binding/buffer limits,
         // then allocated with an out-of-memory error scope at device setup.
         let histogram_entries = voxel_count
             .checked_mul(self.simulation.energy_time_bins as u64)
-            .ok_or_else(|| "energy-history element count overflows u64; reduce dimensions/bins or increase voxel_size_mm".to_string())?;
+            .and_then(|entries| entries.checked_mul(self.emitters.len() as u64))
+            .ok_or_else(|| "frequency-channel energy-history element count overflows u64; reduce dimensions/bins/emitters or increase voxel_size_mm".to_string())?;
         histogram_entries
             .checked_mul(std::mem::size_of::<u32>() as u64)
             .ok_or_else(|| "energy-history byte size overflows u64; reduce dimensions/bins or increase voxel_size_mm".to_string())?;
@@ -535,7 +611,7 @@ impl AppConfig {
         // Allow exactly 2^32 entries (the final valid index is u32::MAX), but do
         // not let a larger GPU buffer silently wrap indices in the shader.
         if histogram_entries > u32::MAX as u64 + 1 {
-            return Err("energy history exceeds the WGSL u32 flattened-index range; reduce world dimensions or energy_time_bins".into());
+            return Err("frequency-channel energy history exceeds the WGSL u32 flattened-index range; reduce world dimensions, energy_time_bins or emitter count".into());
         }
 
         if self.simulation.ray_count == 0 {
@@ -568,31 +644,19 @@ impl AppConfig {
                 || emitter.amplitude < 0.0
                 || emitter.amplitude > 100.0
                 || emitter.direction.iter().any(|v| !v.is_finite())
-                || !emitter
-                    .direction
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f32>()
-                    .is_finite()
+                || !emitter.direction.iter().map(|v| v * v).sum::<f32>().is_finite()
                 || emitter.direction.iter().map(|v| v * v).sum::<f32>() < 1e-8
                 || !emitter.cone_half_angle_degrees.is_finite()
                 || !(1.0..=180.0).contains(&emitter.cone_half_angle_degrees)
             {
-                return Err(format!(
-                    "emitter '{}' has invalid radius, frequency, amplitude or directivity settings",
-                    emitter.name
-                ));
+                return Err(format!("emitter '{}' has invalid radius, frequency, amplitude or directivity settings", emitter.name));
             }
             for axis in 0..3 {
                 let world_extent = self.world.dimensions_mm[axis];
                 let voxel = self.world.voxel_size_mm;
                 let position = emitter.position_mm[axis];
                 if !position.is_finite() {
-                    return Err(format!(
-                        "emitter '{}' has a non-finite {} position",
-                        emitter.name,
-                        axis_name(axis)
-                    ));
+                    return Err(format!("emitter '{}' has a non-finite {} position", emitter.name, axis_name(axis)));
                 }
                 let margin = emitter.radius_mm + voxel * 0.5;
                 if world_extent <= margin * 2.0 {
@@ -621,11 +685,7 @@ impl AppConfig {
             || !self.visualization.felt_base_opacity_multiplier.is_finite()
             || !self.visualization.felt_energy_max_opacity.is_finite()
             || !self.visualization.air_wave_max_opacity.is_finite()
-            || self
-                .visualization
-                .energy_hot_color
-                .iter()
-                .any(|v| !v.is_finite() || *v < 0.0 || *v > 1.0)
+            || self.visualization.energy_hot_color.iter().any(|v| !v.is_finite() || *v < 0.0 || *v > 1.0)
             || self.visualization.voxel_fade_ms <= 0.0
             || self.visualization.wave_shell_thickness_mm <= 0.0
             || self.visualization.felt_energy_gain < 0.0
@@ -661,13 +721,7 @@ impl AppConfig {
                     let p = emitter.position_mm[axis];
                     let min = material.bounds_min_mm[axis];
                     let max = material.bounds_max_mm[axis];
-                    gaps[axis] = if p < min {
-                        min - p
-                    } else if p > max {
-                        p - max
-                    } else {
-                        0.0
-                    };
+                    gaps[axis] = if p < min { min - p } else if p > max { p - max } else { 0.0 };
                 }
                 let distance_to_region = gaps.iter().map(|gap| gap * gap).sum::<f32>().sqrt();
                 let clearance = emitter.radius_mm + self.world.voxel_size_mm;
@@ -723,11 +777,7 @@ impl AppConfig {
 }
 
 fn axis_name(axis: usize) -> &'static str {
-    match axis {
-        0 => "X",
-        1 => "Y",
-        _ => "Z",
-    }
+    match axis { 0 => "X", 1 => "Y", _ => "Z" }
 }
 
 #[cfg(test)]
@@ -746,6 +796,7 @@ mod tests {
         config.world.dimensions_mm = [512.0, 512.0, 512.0];
         assert_eq!(config.validate().unwrap(), [512, 512, 512]);
     }
+
 
     #[test]
     fn energy_history_rejects_wgsl_flat_index_overflow() {
@@ -781,7 +832,7 @@ mod tests {
         let mut second = config.materials[0].clone();
         second.name = "second".into();
         second.bounds_min_mm[0] = 90.0;
-        second.bounds_max_mm[0] = 128.0;
+        second.bounds_max_mm[0] = 112.0;
         let err = {
             config.materials.push(second);
             config.validate().unwrap_err()
@@ -867,11 +918,27 @@ mod tests {
         let mut second = first.clone();
         second.name = "felt-b".into();
         second.bounds_min_mm[0] = 96.0;
-        second.bounds_max_mm[0] = 128.0;
+        second.bounds_max_mm[0] = 112.0;
         second.sound_speed_mps = 190.0;
         second.sigma_a_m_inv = 28.0;
 
         config.materials = vec![first, second];
         assert_eq!(config.validate().unwrap(), [128, 96, 96]);
+    }
+
+    #[test]
+    fn listener_must_be_in_air_after_the_test_material() {
+        let mut config = AppConfig::default();
+        config.listener.position_mm[0] = 100.0;
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("listener must be placed in air after the test volume"));
+    }
+
+    #[test]
+    fn listener_normal_must_face_the_emitter() {
+        let mut config = AppConfig::default();
+        config.listener.normal = [1.0, 0.0, 0.0];
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("listener face normal does not point toward emitter"));
     }
 }
